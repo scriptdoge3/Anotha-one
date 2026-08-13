@@ -1,0 +1,16 @@
+{
+  "name": "load-bank",
+  "version": "0.1.0",
+  "description": "A career sim about operating, abusing and upgrading a 75 kW diesel generator.",
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test test/*.test.js",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "license": "MIT",
+  "private": true,
+  "devDependencies": {
+    "playwright": "^1.62.1"
+  }
+}
