@@ -18,6 +18,12 @@
  *
  * That reversal is the central fact of synchronous machine operation, and it
  * falls out of the model rather than being special-cased for flavour.
+ *
+ * Nothing on this machine regulates itself. There is no automatic voltage
+ * regulator and no isochronous governor: the field is a rheostat and the speed
+ * is whatever the governor droop and your hand on the setpoint make it. What
+ * protects the plant is a bank of protective relays, and every one of them
+ * latches its target and has to be reset by hand before you can close again.
  */
 
 export const NOMINAL_RPM = 1800;
@@ -83,7 +89,6 @@ export function baseSpec() {
     frictionA: 12,
     frictionB: 0.0135,
     inertia: 5.5,
-    durability: 1.0,
     torqueLimit: 720,
 
     // --- thermal --------------------------------------------------------
@@ -97,9 +102,14 @@ export function baseSpec() {
     // --- governing ------------------------------------------------------
     /** Fractional speed drop from no load to full load on the mechanical governor. */
     droop: 0.03,
-    /** An isochronous electronic governor becomes selectable. */
-    isochAvailable: false,
-    loadAnticipation: 0,
+    /** Smallest droop the governor can be set to. A flyweight unit is coarse;
+     *  a hydraulic governor will hold a far tighter line if you ask it to. */
+    droopMin: 0.03,
+    /** Governor hunting: how much the speed wanders about the setpoint. */
+    hunt: 0.0016,
+    /** An aneroid limits the rack to the boost actually present, so the set
+     *  accepts load without laying down smoke. */
+    aneroid: false,
 
     // --- electrical -----------------------------------------------------
     altEff: 0.93,
@@ -107,8 +117,10 @@ export function baseSpec() {
     /** Terminal volts lost to armature reaction at full load, per unit.
      *  A synchronous machine really is this bad without regulation. */
     armatureReaction: 0.28,
-    /** An automatic voltage regulator becomes selectable. */
-    avrFitted: false,
+    /** Series compounding: a current transformer adds to the exciter as load
+     *  rises, cancelling part of the armature reaction. Passive, not a
+     *  regulator -- you still set the base excitation by hand. */
+    compounded: 0,
     /** Exciter time constant, seconds. Field current does not move instantly. */
     excTau: 0.35,
     /** Ceiling on field current, per unit. */
@@ -119,6 +131,10 @@ export function baseSpec() {
     damping: 17,
     /** Check-sync relay: blocks a breaker close that would be violent. */
     checkSync: false,
+    /** Full switchboard instrumentation: pyrometer, oil gauge, kWh register. */
+    fullInstruments: false,
+    /** Oil pump capacity, bar at rated speed on hot oil. */
+    oilPressureRated: 4.1,
 
     batteryKWh: 0,
     batteryKW: 0,
@@ -131,7 +147,6 @@ export function baseSpec() {
     fuel: 'diesel',
 
     tankL: 300,
-    wearBase: 0.15,
   };
 }
 
@@ -144,31 +159,29 @@ export function newMachine(spec = baseSpec()) {
     boost: 0,
     coolantC: 15,
     fuelL: spec.tankL,
-    wear: 0,
     hours: 0,
-    hoursSinceService: 0,
     dpfLoad: 0,
     batterySoc: 1,
 
     // --- operator controls ----------------------------------------------
     /** 0..1. In MANUAL it is the fuel rack directly; otherwise the speed
      *  setpoint, mapped over 1500-1900 rpm. */
-    throttle: 0.75,
-    /** 'manual' | 'droop' | 'isoch' */
+    throttle: 0.5,
+    /** 'manual' (hand on the rack) | 'droop' (flyweight governor) */
     govMode: 'droop',
-    /** Field rheostat, per unit. */
+    /** Droop setting on the governor itself. Tight droop holds frequency on an
+     *  island; wide droop is what lets machines share load on a bus without
+     *  fighting each other. */
+    droopSet: spec.droop,
+    /** Field rheostat, per unit. There is nothing else driving the field. */
     excCmd: 1.0,
-    /** 'manual' | 'avr' */
-    excMode: 'manual',
     /** The field breaker. No field, no volts, no closing onto anything. */
     fieldClosed: false,
     /** The main (generator) breaker. */
     breakerClosed: false,
-    pendingClose: false,
 
     // --- internal state --------------------------------------------------
-    govInteg: 0,
-    avrInteg: 0,
+    huntPhase: 0,
     /** Actual field current, lagging the command through the exciter. */
     exc: 0,
     /** Machine terminal electrical phase, degrees. */
@@ -178,9 +191,19 @@ export function newMachine(spec = baseSpec()) {
     /** Rotor angle ahead of the bus while synchronised, degrees. */
     delta: 0,
     synced: false,
-    protTimer: 0,
-    recloseTimer: 0,
     fanCmd: 1,
+
+    // --- protective relays ------------------------------------------------
+    // Each one latches its target when it operates. Nothing closes again until
+    // the board has been reset by hand.
+    relays: {
+      underFreq: false, overFreq: false,
+      underVolt: false, overVolt: false,
+      overCurrent: false, reversePower: false,
+      lowOilPressure: false, overspeed: false,
+    },
+    /** Seconds each relay has been seeing a fault, for their time delays. */
+    relayTimers: {},
 
     // --- last-step telemetry (read-only for the panel) -------------------
     fuelCmd: 0,
@@ -196,9 +219,15 @@ export function newMachine(spec = baseSpec()) {
     batteryFlowKW: 0,
     hz: 0,
     volts: 0,
+    amps: 0,
     loadPct: 0,
     syncAngle: 0,
     slipHz: 0,
+    /** Engine instruments. */
+    oilBar: 0,
+    egtC: 20,
+    /** Integrating kWh register, like the mechanical one on the board. */
+    kwhRegister: 0,
   };
 }
 
@@ -234,15 +263,43 @@ export function thermalDerate(coolantC) {
   return 1 - ((coolantC - 103) / 15) * 0.45;
 }
 
-/** Speed setpoint the throttle lever is asking for, in rpm. */
+/** Last-step rack, used only to scale governor hunting with load. */
+function fuelHint(m) {
+  return clamp(m.fuelCmd ?? 0, 0, 1);
+}
+
+/** Widest droop the governor will accept. */
+export const DROOP_MAX = 0.06;
+
+/** The droop actually in force: what you set, floored by what the unit can do. */
+export function governorDroop(m, spec) {
+  return clamp(m.droopSet ?? spec.droop, spec.droopMin, DROOP_MAX);
+}
+
+/** Ends of the speed-setting lever's travel, rpm. */
+export const SPEED_MIN = 1740;
+export const SPEED_MAX = 1860;
+
+/**
+ * Speed setpoint the lever is asking for, in rpm.
+ *
+ * The travel covers 58 to 62 Hz and nothing else. A genset lever that swung
+ * from a slow idle to well past rated would put the entire useful range -- and
+ * the whole synchronising window -- inside a few millimetres of movement, which
+ * is exactly the sort of control nobody would build.
+ */
 export function speedSetpoint(throttle) {
-  return 1500 + clamp(throttle, 0, 1) * 400;
+  return SPEED_MIN + clamp(throttle, 0, 1) * (SPEED_MAX - SPEED_MIN);
+}
+
+/** Inverse, for seeding the lever from a speed. */
+export function throttleForSpeed(rpm) {
+  return clamp((rpm - SPEED_MIN) / (SPEED_MAX - SPEED_MIN), 0, 1);
 }
 
 const PROT_UNDER_HZ = 57;
 const PROT_OVER_HZ = 63.5;
 const PROT_DELAY_S = 1.5;
-const RECLOSE_S = 8;
 
 /** How closely you must match a live bus before the breaker may be closed. */
 export const SYNC_LIMITS = {
@@ -343,22 +400,15 @@ export function step(m, spec, env, dt) {
     if (m.govMode === 'manual') {
       // Hand on the rack. Nothing holds the speed but you.
       fuelCmd = clamp(m.throttle, 0, 1);
-    } else if (m.govMode === 'isoch' && spec.isochAvailable) {
-      const err = setRpm - m.rpm;
-      m.govInteg = clamp(m.govInteg + 0.25 * err * dt, 0, 1);
-      fuelCmd = clamp(0.055 * err + m.govInteg, 0, 1);
     } else {
       // Flyweight governor: fuel is a pure proportional function of the speed
-      // shortfall, so the set genuinely runs fast when unloaded.
-      const noLoadRpm = setRpm * (1 + spec.droop);
-      fuelCmd = clamp((noLoadRpm - m.rpm) / (spec.droop * NOMINAL_RPM), 0, 1);
-    }
-    if (spec.loadAnticipation > 0 && m.govMode !== 'manual') {
-      fuelCmd = clamp(
-        fuelCmd + (spec.loadAnticipation * (env.demandRateKW ?? 0)) / RATED_KW,
-        0,
-        1,
-      );
+      // shortfall, so the set genuinely runs fast when unloaded. Real governors
+      // also hunt a little about the setpoint, and a cheap one hunts more.
+      m.huntPhase = (m.huntPhase + dt * 2.6) % (Math.PI * 2);
+      const hunt = spec.hunt * Math.sin(m.huntPhase) * (0.35 + fuelHint(m));
+      const droop = governorDroop(m, spec);
+      const noLoadRpm = setRpm * (1 + droop);
+      fuelCmd = clamp((noLoadRpm - m.rpm) / (droop * NOMINAL_RPM) + hunt, 0, 1);
     }
     fuelCmd *= thermalDerate(m.coolantC);
   } else if (m.cranking > 0) {
@@ -375,7 +425,9 @@ export function step(m, spec, env, dt) {
 
   // The smoke limiter caps the rack at the air actually available. This is the
   // mechanism behind turbo lag: the pump is willing, the air is not.
-  const limiterMargin = spec.boostGain > 0 ? 1.06 : 1.2;
+  // An aneroid boost compensator physically ties the rack stop to inlet
+  // manifold pressure, so the pump cannot deliver fuel the air will not burn.
+  const limiterMargin = spec.aneroid ? 1.0 : spec.boostGain > 0 ? 1.06 : 1.2;
   const fuelActual = Math.min(fuelAbs, airAbs * limiterMargin);
 
   let combEff = 1;
@@ -404,25 +456,7 @@ export function step(m, spec, env, dt) {
   // The exciter has a time constant, so field current lags the rheostat.
   let excTarget = 0;
   if (m.fieldClosed && m.running) {
-    if (m.excMode === 'avr' && spec.avrFitted) {
-      // On an island the AVR holds terminal volts; tied to a bus, volts are
-      // fixed by the bus, so it regulates power factor instead.
-      if (bus && m.synced) {
-        // Regulate REACTIVE power, not power factor directly: raising the
-        // field raises kVAr, which pushes power factor the other way, so a
-        // naive loop on pf runs the field straight to its ceiling.
-        const qTarget = Math.max(m.deliveredKW, 0) * 0.329;   // 0.95 lagging
-        const qErr = qTarget - (m.kvar ?? 0);
-        m.avrInteg = clamp(m.avrInteg + qErr * dt * 0.004, -0.9, 0.9);
-        excTarget = clamp(1.0 + m.avrInteg, 0.3, spec.excMax);
-      } else {
-        const vErr = (NOMINAL_V - m.volts) / NOMINAL_V;
-        m.avrInteg = clamp(m.avrInteg + vErr * dt * 3.2, -1, 1);
-        excTarget = clamp(1.0 + vErr * 1.6 + m.avrInteg, 0.1, spec.excMax);
-      }
-    } else {
-      excTarget = clamp(m.excCmd, 0, spec.excMax);
-    }
+    excTarget = clamp(m.excCmd, 0, spec.excMax);
   }
   m.exc += ((excTarget - m.exc) * dt) / Math.max(spec.excTau, 0.02);
   m.exc = clamp(m.exc, 0, spec.excMax);
@@ -478,8 +512,7 @@ export function step(m, spec, env, dt) {
       // Pull-out: the rotor has slipped a pole. Nothing good follows.
       m.synced = false;
       m.breakerClosed = false;
-      m.recloseTimer = RECLOSE_S;
-      m.wear = clamp(m.wear + 1.5, 0, 100);
+      m.relays.overCurrent = true;
       events.push({ type: 'pole-slip' });
     }
   } else {
@@ -487,9 +520,11 @@ export function step(m, spec, env, dt) {
     const requestedKW = Math.max(0, demand - batteryFlow);
     electricalKW = m.breakerClosed ? Math.min(requestedKW, spec.altRatingKW) : 0;
     const loadFrac = clamp(electricalKW / spec.altRatingKW, 0, 1.4);
-    // Terminal volts sag with load through armature reaction. Without an AVR
-    // this is the operator's problem: wind the field up as load comes on.
-    volts = Math.max(0, NOMINAL_V * Epu - spec.armatureReaction * NOMINAL_V * loadFrac);
+    // Terminal volts sag with load through armature reaction. Series
+    // compounding cancels part of it passively; the rest is the operator's
+    // problem, to be wound out on the rheostat as load comes on.
+    const netSag = Math.max(0, spec.armatureReaction - spec.compounded);
+    volts = Math.max(0, NOMINAL_V * Epu - netSag * NOMINAL_V * loadFrac);
     // Site loads are inductive; assume a typical 0.85 lagging power factor.
     kvar = electricalKW * 0.62;
     Tload = (electricalKW / spec.altEff + fanKW) * 1000 / omega;
@@ -523,7 +558,7 @@ export function step(m, spec, env, dt) {
     m.running = false;
     m.breakerClosed = false;
     m.synced = false;
-    m.wear = clamp(m.wear + 4, 0, 100);
+    m.relays.overspeed = true;
     events.push({ type: 'overspeed' });
   }
 
@@ -556,30 +591,30 @@ export function step(m, spec, env, dt) {
   m.coolantC += ((heatW - rejectW) / spec.thermalMass) * dt;
   if (m.coolantC > 118 && m.running) events.push({ type: 'overheat' });
 
-  // ---- wear ------------------------------------------------------------
-  if (m.running) {
-    const loadFactor = clamp(Math.abs(electricalKW) / RATED_KW, 0, 1.4);
-    const heatPenalty = m.coolantC > 100 ? 1 + (m.coolantC - 100) * 0.12 : 1;
-    const smokePenalty = 1 + smoke * 1.8;
-    const servicePenalty = m.hoursSinceService > 250 ? 1.6 : 1;
-    const oilRelief = spec.oilCooled && loadFactor > 0.7 ? 0.7 : 1;
-    // Running the field hard cooks the rotor.
-    const fieldPenalty = m.exc > 1.55 ? 1 + (m.exc - 1.55) * 2.2 : 1;
-    const rate =
-      (spec.wearBase *
-        (0.4 + Math.pow(loadFactor, 1.6)) *
-        heatPenalty * smokePenalty * servicePenalty * oilRelief * fieldPenalty *
-        (env.abrasion ?? 1)) / spec.durability;
-    m.wear = clamp(m.wear + (rate * dt) / 3600, 0, 100);
-    m.hours += dt / 3600;
-    m.hoursSinceService += dt / 3600;
-    if (m.wear >= 100) {
-      m.running = false;
-      m.breakerClosed = false;
-      m.synced = false;
-      events.push({ type: 'seized' });
-    }
-  }
+  // ---- engine instruments ---------------------------------------------
+  if (m.running) m.hours += dt / 3600;
+
+  // Oil pressure follows pump speed, and falls away as the oil thins with
+  // heat. Lose it and the engine has to be shut down.
+  const oilTempC = m.coolantC + 12;
+  const viscosity = clamp(1.25 - Math.max(0, oilTempC - 85) * 0.011, 0.45, 1.25)
+    * (spec.oilCooled ? 1.08 : 1);
+  m.oilBar = m.running
+    ? clamp(spec.oilPressureRated * (0.28 + 0.72 * rpmNorm) * viscosity, 0, 7)
+    : 0;
+
+  // Exhaust gas temperature: what the pyrometer on the manifold reads. Rises
+  // with load, and hard with over-fuelling.
+  const loadFrac = clamp(Math.abs(electricalKW) / spec.altRatingKW, 0, 1.4);
+  const egtTarget = burning
+    ? (env.ambientC ?? 20) + 195 + 385 * Math.pow(loadFrac, 1.08) + smoke * 210
+    : (env.ambientC ?? 20);
+  // The manifold and probe have real thermal mass, so it lags.
+  m.egtC += (egtTarget - m.egtC) * Math.min(1, dt / 9);
+
+  // Line current, as the ammeter reads it.
+  m.amps = volts > 50 ? (Math.hypot(electricalKW, kvar) * 1000) / (Math.sqrt(3) * volts) : 0;
+  m.kwhRegister += (Math.max(0, electricalKW) * dt) / 3600;
 
   if (spec.capabilities.includes('dpf')) {
     m.dpfLoad = clamp(m.dpfLoad + smoke * dt * 0.004 - dt * 0.00015, 0, 1);
@@ -599,34 +634,63 @@ export function step(m, spec, env, dt) {
     m.syncAngle = 0;
   }
 
-  // ---- protection ------------------------------------------------------
+  // ---- protective relays -----------------------------------------------
+  // Every one of these latches its target. The board has to be reset by hand
+  // before the breaker will close again, which is exactly how switchgear of
+  // the period behaved -- and why an operator walks the panel after a trip.
+  const T = m.relayTimers;
+  const holdFor = (key, faulted, delay) => {
+    T[key] = faulted ? (T[key] ?? 0) + dt : 0;
+    return T[key] > delay;
+  };
+
+  const ratedAmps = (spec.altRatingKW * 1000) / (Math.sqrt(3) * NOMINAL_V * 0.8);
+  const offBus = !(m.synced && bus);
+  const tripped = [];
+
+  if (m.running && m.oilBar < 1.0 && holdFor('lop', true, 2.5)) {
+    m.relays.lowOilPressure = true;
+    tripped.push('lowOilPressure');
+  } else if (!(m.running && m.oilBar < 1.0)) T.lop = 0;
+
   if (m.breakerClosed) {
-    const offBus = !(m.synced && bus);
-    const badHz = offBus && (hz < PROT_UNDER_HZ || hz > PROT_OVER_HZ);
-    const badV = volts < NOMINAL_V * 0.55;
-    const bad = badHz || badV || !m.running;
-    m.protTimer = bad ? m.protTimer + dt : 0;
-    if (m.protTimer > PROT_DELAY_S || !m.running) {
-      m.breakerClosed = false;
-      m.synced = false;
-      m.protTimer = 0;
-      m.recloseTimer = RECLOSE_S;
-      events.push({ type: 'trip', hz });
+    if (offBus && holdFor('uf', hz < PROT_UNDER_HZ, PROT_DELAY_S)) {
+      m.relays.underFreq = true; tripped.push('underFreq');
     }
-  } else if (m.recloseTimer > 0) {
-    m.recloseTimer = Math.max(0, m.recloseTimer - dt);
-    // Auto-reclose only ever applies to a dead bus; you never get an automatic
-    // close onto a live one.
-    if (m.recloseTimer === 0 && !bus && m.running && hz > 58.5 && hz < 62
-        && volts > NOMINAL_V * 0.85) {
-      m.breakerClosed = true;
-      events.push({ type: 'reclose' });
+    if (offBus && holdFor('of', hz > PROT_OVER_HZ, 1.0)) {
+      m.relays.overFreq = true; tripped.push('overFreq');
     }
-  } else if (m.pendingClose && !bus && m.running && hz > 58.5 && hz < 62
-             && volts > NOMINAL_V * 0.85) {
-    m.breakerClosed = true;
-    m.pendingClose = false;
-    events.push({ type: 'closed-on-load' });
+    // Real under-voltage relays run several seconds of delay, which is exactly
+    // the window an operator needs to wind the field up as load comes on.
+    if (holdFor('uv', volts < NOMINAL_V * 0.78, 4.0)) {
+      m.relays.underVolt = true; tripped.push('underVolt');
+    }
+    if (holdFor('ov', volts > NOMINAL_V * 1.15, 1.0)) {
+      m.relays.overVolt = true; tripped.push('overVolt');
+    }
+    // Inverse-time overcurrent: a small overload is tolerated for a while, a
+    // large one is not.
+    const iPu = ratedAmps > 0 ? m.amps / ratedAmps : 0;
+    if (holdFor('oc', iPu > 1.15, iPu > 1.5 ? 1.0 : 8.0)) {
+      m.relays.overCurrent = true; tripped.push('overCurrent');
+    }
+    // Reverse power: the bus is motoring the set. Left alone it will wreck the
+    // engine, so the relay throws it off line.
+    if (!offBus && holdFor('rp', electricalKW < -spec.altRatingKW * 0.05, 3.0)) {
+      m.relays.reversePower = true; tripped.push('reversePower');
+    }
+  } else {
+    for (const k of ['uf', 'of', 'uv', 'ov', 'oc', 'rp']) T[k] = 0;
+  }
+
+  if (tripped.length) {
+    m.breakerClosed = false;
+    m.synced = false;
+    events.push({ type: 'relay-trip', relays: tripped });
+    if (m.relays.lowOilPressure) {
+      m.running = false;
+      events.push({ type: 'oil-shutdown' });
+    }
   }
 
   // ---- telemetry -------------------------------------------------------
@@ -651,16 +715,16 @@ export function step(m, spec, env, dt) {
  * shocks the whole driveline.
  */
 export function closeBreaker(m, spec, env) {
+  if (anyRelayLatched(m)) {
+    return { ok: false, msg: 'Relay target standing — reset the board first.', locked: true };
+  }
   const check = syncCheck(m, env);
   if (check.ok) {
     m.breakerClosed = true;
-    m.pendingClose = false;
-    m.protTimer = 0;
     if (env.bus) {
       m.synced = true;
       // The rotor takes up the phase error it was closed at.
       m.delta = wrapDeg(m.phase - m.busPhase);
-      m.avrInteg = 0;
     }
     return { ok: true };
   }
@@ -681,22 +745,40 @@ export function forceCloseBreaker(m, spec, env) {
 
   const severity = check.severity ?? 0.5;
   m.breakerClosed = true;
-  m.pendingClose = false;
   if (env.bus) {
     m.synced = true;
     m.delta = wrapDeg(m.phase - m.busPhase);
   }
-  // An out-of-phase close is a violent mechanical event: the rotor is dragged
-  // into step against the bus and everything in the driveline feels it.
-  const wear = 3 + severity * 22;
-  m.wear = clamp(m.wear + wear, 0, 100);
+  // An out-of-phase close is a violent electrical and mechanical event: an
+  // enormous current surge as the rotor is dragged into step. The overcurrent
+  // relay sees it and throws the set straight back off line.
   m.rpm = Math.max(0, m.rpm * (1 - severity * 0.28));
-  if (severity > 0.55) {
+  if (severity > 0.3) {
     m.breakerClosed = false;
     m.synced = false;
-    m.recloseTimer = RECLOSE_S;
+    m.relays.overCurrent = true;
+    if (severity > 0.6) m.relays.underVolt = true;
   }
-  return { ok: true, shock: true, severity, wear };
+  return { ok: true, shock: true, severity };
+}
+
+/** Is any protective relay target standing? */
+export function anyRelayLatched(m) {
+  return Object.values(m.relays ?? {}).some(Boolean);
+}
+
+/** Names of the standing targets, for the panel. */
+export function latchedRelays(m) {
+  return Object.entries(m.relays ?? {}).filter(([, v]) => v).map(([k]) => k);
+}
+
+/**
+ * Walk the board and reset every flag. An operator does this by hand, having
+ * first worked out why it tripped.
+ */
+export function resetRelays(m) {
+  for (const k of Object.keys(m.relays ?? {})) m.relays[k] = false;
+  m.relayTimers = {};
 }
 
 /** Convenience for tests and for settling the machine before a job. */

@@ -5,9 +5,9 @@
 
 import {
   createGame, advance, acceptContract, abandonJob, clearFinishedJob,
-  startEngine, stopEngine, setBreaker, refuel, buyTech, doService, buyTank,
+  startEngine, stopEngine, setBreaker, refuel, buyTech, buyTank,
   refreshBoard, setThrottle, bumpThrottle, setGovMode, setExcitation,
-  bumpExcitation, setExcMode, setFieldBreaker, refreshSpec, SPEEDS,
+  bumpExcitation, bumpDroop, setFieldBreaker, resetRelays, refreshSpec, SPEEDS,
 } from './state.js';
 import * as save from './save.js';
 import {
@@ -104,7 +104,7 @@ function switchTab(tab) {
 // ------------------------------------------------------------------- input
 
 document.addEventListener('click', (ev) => {
-  const t = ev.target.closest('[data-act],[data-speed],[data-accept],[data-tech],[data-buy],[data-service],[data-tab],[data-gov],[data-exc]');
+  const t = ev.target.closest('[data-act],[data-speed],[data-accept],[data-tech],[data-buy],[data-tab],[data-gov]');
   if (!t) return;
 
   if (t.dataset.tab) return switchTab(t.dataset.tab);
@@ -132,21 +132,20 @@ document.addEventListener('click', (ev) => {
     return;
   }
 
-  if (t.dataset.service) return apply(doService(g, t.dataset.service));
-
   if (t.dataset.gov) return apply(setGovMode(g, t.dataset.gov));
-  if (t.dataset.exc) return apply(setExcMode(g, t.dataset.exc));
 
   switch (t.dataset.act) {
     case 'start': return apply(startEngine(g));
     case 'field': return apply(setFieldBreaker(g, !g.machine.fieldClosed));
+    case 'trip': return apply(setBreaker(g, false));
+    case 'close': return apply(setBreaker(g, true));
+    case 'reset-relays': return apply(resetRelays(g));
     case 'force-close':
       if (confirm('Force the breaker shut out of step?\n\nThe rotor will be dragged into step with the bus. Expect real damage.')) {
         apply(setBreaker(g, true, { force: true }));
       }
       return;
     case 'stop': return apply(stopEngine(g));
-    case 'breaker': return apply(setBreaker(g, !g.machine.breakerClosed));
     case 'refuel': return apply(refuel(g));
     case 'buy-tank': return apply(buyTank(g));
     case 'refresh-board': return apply(refreshBoard(g));
@@ -199,6 +198,7 @@ document.addEventListener('pointerdown', (ev) => {
   const which = t.dataset.nudge;
   const fire = () => {
     if (which === 'throttle') bumpThrottle(g, step);
+    else if (which === 'droop') bumpDroop(g, step);
     else bumpExcitation(g, step);
   };
   fire();

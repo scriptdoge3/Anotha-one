@@ -67,7 +67,7 @@ await page.click('[data-act="start"]');
 await page.waitForTimeout(1200);
 await page.click('[data-act="field"]');
 await page.waitForTimeout(900);
-await page.click('[data-act="breaker"]');
+await page.click('[data-act="close"]');
 await page.waitForTimeout(1200);
 // Trim the field until the voltmeter reads nominal, as an operator would.
 for (let i = 0; i < 40; i++) {

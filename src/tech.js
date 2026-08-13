@@ -67,7 +67,6 @@ export const TECH = [
     apply: (s) => {
       s.chargeDensityBonus += 0.1;
       s.coolantHeatFrac -= 0.02;
-      s.durability *= 1.08;
     },
   },
   {
@@ -144,10 +143,11 @@ export const TECH = [
     name: 'Full-Synthetic Lubricant',
     cost: 700,
     blurb: 'Group IV base oil with a proper additive pack.',
-    detail: 'Cheapest durability in the game, and it shears less when the sump gets hot.',
+    detail:
+      'Group IV base stock holds its film and its pressure when the sump is hot, so the oil gauge stays where it should on a long hard run instead of sagging towards the low-pressure trip.',
     apply: (s) => {
-      s.durability *= 1.25;
       s.frictionB *= 0.96;
+      s.oilPressureRated += 0.55;
     },
   },
   {
@@ -158,11 +158,12 @@ export const TECH = [
     name: 'Forged Steel Crankshaft',
     cost: 8200,
     blurb: 'Forged and nitrided, with wider main journals.',
-    detail: 'Raises the torque the bottom end will tolerate before something lets go. A prerequisite for running real boost.',
+    detail:
+      'Raises the torque the bottom end will tolerate before something lets go, and the heavier flywheel steadies the shaft: less hunting, and a shallower dip when a big load lands.',
     apply: (s) => {
       s.torqueLimit += 140;
-      s.durability *= 1.2;
       s.inertia += 0.6;
+      s.hunt *= 0.8;
     },
   },
   {
@@ -205,9 +206,12 @@ export const TECH = [
     name: 'Nitrided Cylinder Liners',
     cost: 7300,
     blurb: 'Plateau-honed, surface-hardened bores.',
-    detail: 'The single largest reduction in bore wear available, and it holds its crosshatch under abrasive site conditions.',
+    detail:
+      'A hard, finely honed bore seals the rings properly. Less blow-by past the pistons means more of every combustion stroke reaches the crank, and a cleaner crankcase keeps the oil pressure up.',
     apply: (s) => {
-      s.durability *= 1.55;
+      s.indicatedEff += 0.012;
+      s.oilPressureRated += 0.35;
+      s.frictionB *= 0.95;
     },
   },
   {
@@ -222,7 +226,6 @@ export const TECH = [
     apply: (s) => {
       s.frictionA -= 3;
       s.frictionB *= 0.72;
-      s.durability *= 1.1;
     },
   },
 
@@ -295,10 +298,10 @@ export const TECH = [
     name: 'Engine Oil Cooler',
     cost: 2600,
     blurb: 'Plate heat exchanger in the oil circuit.',
-    detail: 'Oil film strength collapses with temperature. Holding the sump cool is what lets you sit at high load for days.',
+    detail:
+      'Oil thins as it heats, and thin oil means low pressure. A plate exchanger in the oil circuit holds the gauge up where it belongs when the set has been sitting at high load for days.',
     apply: (s) => {
       s.oilCooled = true;
-      s.durability *= 1.12;
       s.radiatorUA += 60;
     },
   },
@@ -340,13 +343,13 @@ export const TECH = [
     id: 'avr',
     branch: 'control',
     row: 0,
-    name: 'Automatic Voltage Regulator',
+    name: 'Compound-Wound Exciter',
     cost: 2200,
-    blurb: 'Closed-loop excitation control.',
+    blurb: 'Current transformer feeding the exciter field.',
     detail:
-      'Adds an AVR position to the excitation selector. Left on hand control, a synchronous machine loses close to a third of its terminal volts between no load and full load, and you have to wind the field up yourself to chase it. The AVR does that for you — and on a live bus it regulates power factor instead.',
+      'A synchronous machine loses close to a third of its terminal volts between no load and full load, and every one of them has to be wound back in on the rheostat by hand. Compounding feeds load current back into the exciter so most of that sag never happens. It is a transformer, not a regulator — you still set the volts yourself, there is just far less chasing.',
     apply: (s) => {
-      s.avrFitted = true;
+      s.compounded += 0.16;
     },
   },
   {
@@ -357,9 +360,12 @@ export const TECH = [
     name: 'Precision Governor Linkage',
     cost: 1800,
     blurb: 'Ball-jointed rack linkage, rebuilt flyweights.',
-    detail: 'Halves the droop of the mechanical governor, so speed falls less between no load and full load. A stopgap, but a cheap one.',
+    detail:
+      'Rebuilt flyweights and ball-jointed linkage take the lost motion out of the governor: droop halves, and it stops wandering about the setpoint. A stopgap, but a cheap one.',
     apply: (s) => {
       s.droop = 0.015;
+      s.droopMin = 0.015;
+      s.hunt *= 0.5;
     },
   },
   {
@@ -367,13 +373,15 @@ export const TECH = [
     branch: 'control',
     row: 2,
     requires: ['govlinkage'],
-    name: 'Isochronous Electronic Governor',
+    name: 'Hydraulic Governor',
     cost: 8800,
-    blurb: 'Closed-loop speed control with integral action.',
+    blurb: 'Oil-servo governor with adjustable droop.',
     detail:
-      'Adds an ISOCH position to the governor selector: it holds exactly the speed you set, at any load, instead of drooping across the range. Everything with a tight frequency clause needs this.',
+      'A flyweight governor working through an oil servo instead of a rod and spring. Droop comes down to half a percent, the hunting all but disappears, and it moves the rack far faster on a load change. Still a droop governor: the speed setting is yours to make.',
     apply: (s) => {
-      s.isochAvailable = true;
+      s.droop = 0.005;
+      s.droopMin = 0.005;
+      s.hunt *= 0.15;
     },
   },
   {
@@ -381,13 +389,13 @@ export const TECH = [
     branch: 'control',
     row: 3,
     requires: ['isoch', 'turbo'],
-    name: 'Load-Anticipating Control',
+    name: 'Aneroid Boost Compensator',
     cost: 10200,
-    blurb: 'Feed-forward from the site breaker signals.',
+    blurb: 'Rack stop tied to manifold pressure.',
     detail:
-      'Starts fuelling before the load actually lands, so boost is already there. The answer to turbo lag on step loads.',
+      'A bellows on the inlet manifold that physically holds the fuel rack back until the boost is actually there. The engine takes longer to pick up a big step, but it stops laying a black cloud over the site every time it does.',
     apply: (s) => {
-      s.loadAnticipation = 0.55;
+      s.aneroid = true;
     },
   },
   {
@@ -426,14 +434,14 @@ export const TECH = [
     branch: 'control',
     row: 3,
     requires: ['isoch'],
-    name: 'Predictive Maintenance Telemetry',
-    cost: 6300,
-    blurb: 'Oil debris sensing, vibration spectra, cloud logging.',
+    name: 'Full Switchboard Instruments',
+    cost: 4300,
+    blurb: 'Exhaust pyrometer, oil gauge and kWh register.',
     detail:
-      'Shows true component condition instead of an idiot light, and lets you service on evidence. Cuts service cost sharply.',
+      'A stock set gives you a voltmeter, a frequency meter and an ammeter. This adds the instruments that tell you what the engine is actually doing: a thermocouple pyrometer on the exhaust manifold, a proper oil pressure gauge, and an integrating kilowatt-hour register on the board.',
     apply: (s) => {
+      s.fullInstruments = true;
       s.capabilities.push('telemetry');
-      s.durability *= 1.1;
     },
   },
 

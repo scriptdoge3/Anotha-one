@@ -1,7 +1,7 @@
 import { newMachine } from './sim.js';
 import { specFor } from './state.js';
 
-const KEY = 'loadbank.save.v1';
+const KEY = 'loadbank.save.v2';
 
 /** Only persist authored state; spec and derived telemetry are rebuilt. */
 const FIELDS = [
@@ -32,7 +32,7 @@ export function load() {
     const raw = localStorage.getItem(KEY);
     if (!raw) return null;
     const data = JSON.parse(raw);
-    if (data.version !== 1) return null;
+    if (data.version !== 2) return null;
     const g = { ...data, speed: 0 };
     g.spec = specFor(g);
     g.machine = { ...newMachine(g.spec), ...(data.machine ?? {}) };

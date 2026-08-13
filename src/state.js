@@ -14,6 +14,12 @@ import {
   forceCloseBreaker,
   syncCheck,
   speedSetpoint,
+  throttleForSpeed,
+  governorDroop,
+  DROOP_MAX,
+  resetRelays as simResetRelays,
+  latchedRelays,
+  anyRelayLatched,
   clamp,
   RATED_KW,
 } from './sim.js';
@@ -33,39 +39,9 @@ export const SPEEDS = [0, 1, 5, 30, 120, 600];
 
 export const BASE_FUEL_PRICE = { diesel: 1.28, hvo: 1.66 };
 
-/** How far ahead the site's breaker signals warn the governor, seconds. */
-const ANTICIPATION_LOOKAHEAD_S = 0.8;
-
-export const SERVICE = {
-  routine: {
-    id: 'routine',
-    name: 'Routine Service',
-    desc: 'Oil, filters, valve clearances. Resets the service interval and takes a little wear off.',
-    cost: 420,
-    telemetryCost: 260,
-    hours: 3,
-  },
-  top: {
-    id: 'top',
-    name: 'Top-End Overhaul',
-    desc: 'Head off, injectors, valves, turbo cartridge. Removes about half the accumulated wear.',
-    cost: 4200,
-    telemetryCost: 3400,
-    hours: 14,
-  },
-  rebuild: {
-    id: 'rebuild',
-    name: 'Full Rebuild',
-    desc: 'Strip to the block, new liners, bearings and rings. The engine comes back as new.',
-    cost: 12000,
-    telemetryCost: 10200,
-    hours: 40,
-  },
-};
-
 export function createGame() {
   const g = {
-    version: 1,
+    version: 2,
     money: 2400,
     reputation: 0,
     day: 1,
@@ -179,33 +155,6 @@ export function refuel(g, litres = Infinity) {
   return { ok: true };
 }
 
-export function doService(g, kind) {
-  const svc = SERVICE[kind];
-  if (!svc) return { ok: false, msg: 'Unknown service.' };
-  if (g.job) return { ok: false, msg: 'Finish or abandon the job first.' };
-  const hasTelemetry = g.spec.capabilities.includes('telemetry');
-  const cost = hasTelemetry ? svc.telemetryCost : svc.cost;
-  if (g.money < cost) return { ok: false, msg: `Not enough money — ${svc.name} costs ${fmtMoney(cost)}.` };
-  g.money -= cost;
-  const m = g.machine;
-  if (kind === 'routine') {
-    m.hoursSinceService = 0;
-    m.wear = Math.max(0, m.wear - 3);
-  } else if (kind === 'top') {
-    m.hoursSinceService = 0;
-    m.wear = Math.max(0, m.wear * 0.5);
-    m.dpfLoad = 0;
-  } else {
-    m.hoursSinceService = 0;
-    m.wear = 0;
-    m.dpfLoad = 0;
-  }
-  g.day += Math.ceil(svc.hours / 8);
-  rollFuelPrice(g);
-  logLine(g, `${svc.name} completed — ${fmtMoney(cost)}. Wear now ${m.wear.toFixed(1)}%.`, 'good');
-  return { ok: true };
-}
-
 export const TANK_UPGRADE = {
   name: 'Bunded 600 L Belly Tank',
   cost: 2400,
@@ -315,7 +264,9 @@ export function startEngine(g) {
   const m = g.machine;
   if (m.running) return { ok: false, msg: 'Already running.' };
   if (m.fuelL <= 0) return { ok: false, msg: 'No fuel.' };
-  if (m.wear >= 100) return { ok: false, msg: 'Engine is seized. It needs a rebuild.' };
+  if (anyRelayLatched(m)) {
+    return { ok: false, msg: 'Relay target standing — reset the board first.' };
+  }
   m.cranking = 6;
   return { ok: true };
 }
@@ -326,11 +277,29 @@ export function stopEngine(g) {
   m.breakerClosed = false;
   m.synced = false;
   m.cranking = 0;
-  m.govInteg = 0;
-  m.avrInteg = 0;
-  m.pendingClose = false;
   return { ok: true };
 }
+
+/** Walk the board and drop every standing relay target. */
+export function resetRelays(g) {
+  const standing = latchedRelays(g.machine);
+  if (!standing.length) return { ok: false, msg: 'No targets standing.' };
+  simResetRelays(g.machine);
+  logLine(g, `Relay board reset (${standing.map(relayLabel).join(', ')}).`, 'info');
+  return { ok: true };
+}
+
+export const RELAY_LABELS = {
+  underFreq: 'Under Frequency',
+  overFreq: 'Over Frequency',
+  underVolt: 'Under Volts',
+  overVolt: 'Over Volts',
+  overCurrent: 'Over Current',
+  reversePower: 'Reverse Power',
+  lowOilPressure: 'Low Oil Pressure',
+  overspeed: 'Overspeed',
+};
+export const relayLabel = (k) => RELAY_LABELS[k] ?? k;
 
 /** Environment for the job in progress (or the yard, when idle). */
 export function envFor(g) {
@@ -358,9 +327,6 @@ export function bumpThrottle(g, delta) {
 }
 
 export function setGovMode(g, mode) {
-  if (mode === 'isoch' && !g.spec.isochAvailable) {
-    return { ok: false, msg: 'No electronic governor fitted.' };
-  }
   const m = g.machine;
   if (m.govMode === mode) return { ok: true };
 
@@ -368,21 +334,31 @@ export function setGovMode(g, mode) {
   // rack exactly where it already is -- otherwise selecting droop while
   // carrying load throws the rack shut and, on a bus, slips a pole.
   const rack = clamp(m.fuelCmd, 0, 1);
-  const droop = g.spec.droop;
+  const droop = governorDroop(m, g.spec);
   if (m.running) {
     if (mode === 'manual') {
       m.throttle = rack;
-    } else if (mode === 'droop') {
+    } else {
       const setRpm = (rack * droop * 1800 + m.rpm) / (1 + droop);
-      m.throttle = clamp((setRpm - 1500) / 400, 0, 1);
-    } else if (mode === 'isoch') {
-      m.throttle = clamp((m.rpm - 1500) / 400, 0, 1);
-      m.govInteg = rack;
+      m.throttle = throttleForSpeed(setRpm);
     }
   }
   m.govMode = mode;
-  if (mode !== 'isoch') m.govInteg = 0;
   return { ok: true };
+}
+
+/**
+ * Droop setting on the governor. Tight droop holds frequency hard on an island;
+ * wide droop is what lets a machine share load on a bus without the rack
+ * slamming between its stops.
+ */
+export function setDroop(g, v) {
+  g.machine.droopSet = clamp(v, g.spec.droopMin, DROOP_MAX);
+  return { ok: true };
+}
+
+export function bumpDroop(g, delta) {
+  return setDroop(g, (g.machine.droopSet ?? g.spec.droop) + delta);
 }
 
 export function setExcitation(g, v) {
@@ -394,27 +370,12 @@ export function bumpExcitation(g, delta) {
   return setExcitation(g, g.machine.excCmd + delta);
 }
 
-export function setExcMode(g, mode) {
-  if (mode === 'avr' && !g.spec.avrFitted) {
-    return { ok: false, msg: 'No automatic voltage regulator fitted.' };
-  }
-  const m = g.machine;
-  if (mode === 'manual' && m.excMode === 'avr') {
-    // Take over at whatever the AVR had wound the field to.
-    m.excCmd = clamp(m.exc, 0, g.spec.excMax);
-  }
-  m.excMode = mode;
-  m.avrInteg = 0;
-  return { ok: true };
-}
-
 export function setFieldBreaker(g, closed) {
   const m = g.machine;
   if (!closed && m.breakerClosed) {
     return { ok: false, msg: 'Open the main breaker before killing the field.' };
   }
   m.fieldClosed = closed;
-  if (!closed) m.avrInteg = 0;
   logLine(g, closed ? 'Field breaker closed — excitation live.' : 'Field breaker opened.', 'info');
   return { ok: true };
 }
@@ -430,8 +391,6 @@ export function setBreaker(g, closed, { force = false } = {}) {
   if (!closed) {
     m.breakerClosed = false;
     m.synced = false;
-    m.pendingClose = false;
-    m.recloseTimer = 0;
     return { ok: true };
   }
 
@@ -446,7 +405,7 @@ export function setBreaker(g, closed, { force = false } = {}) {
   if (res.shock) {
     logLine(
       g,
-      `Closed out of step. The whole driveline felt it — ${res.wear.toFixed(0)}% wear in one bang.`,
+      'Closed out of step. The surge threw the overcurrent relay straight out.',
       'bad',
     );
     return { ok: true, msg: 'Out-of-phase close!' };
@@ -454,11 +413,6 @@ export function setBreaker(g, closed, { force = false } = {}) {
   if (res.ok) {
     if (env.bus) logLine(g, 'Synchronised and on the bus.', 'good');
     return { ok: true };
-  }
-  // Off a live bus, an unready machine just arms the breaker until it is ready.
-  if (!env.bus && !res.blocked) {
-    m.pendingClose = true;
-    return { ok: true, msg: 'Breaker armed — will close once the set is up to speed.' };
   }
   return { ok: false, msg: res.msg };
 }
@@ -482,10 +436,10 @@ const EVENT_TEXT = {
   overheat: ['Coolant over 118 °C — the set is derating hard.', 'bad'],
   overspeed: ['OVERSPEED TRIP — fuel cut. Watch the rack when you drop load.', 'bad'],
   'pole-slip': ['Pole slip — lost synchronism with the bus and thrown off line.', 'bad'],
+  'oil-shutdown': ['LOW OIL PRESSURE — engine shut down to save it.', 'bad'],
   seized: ['Catastrophic failure. The engine has seized.', 'bad'],
   trip: ['Breaker tripped on under-frequency.', 'bad'],
-  reclose: ['Breaker reclosed automatically.', 'info'],
-  'closed-on-load': ['Breaker closed — set is on load.', 'good'],
+
 };
 
 /**
@@ -517,16 +471,20 @@ export function advance(g, simSeconds) {
     if (contract && !job.done) {
       const tH = job.progress.elapsedH;
       demand = demandAt(contract.profile, tH);
-      const aheadH = tH + ANTICIPATION_LOOKAHEAD_S / 3600;
-      env.demandRateKW =
-        (demandAt(contract.profile, aheadH) - demand) / ANTICIPATION_LOOKAHEAD_S;
-    } else {
-      env.demandRateKW = 0;
     }
     env.demandKW = demand;
 
     const events = step(m, spec, env, h);
     for (const e of events) {
+      if (e.type === 'relay-trip') {
+        const key = `relay:${e.relays.join(',')}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          logLine(g, `TRIP — ${e.relays.map(relayLabel).join(' + ')}. Target standing.`, 'bad');
+        }
+        if (job && !job.done) job.progress.tripCount += 1;
+        continue;
+      }
       if (!seen.has(e.type)) {
         seen.add(e.type);
         const t = EVENT_TEXT[e.type];

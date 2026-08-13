@@ -20,12 +20,19 @@ function running(owned = [], envOverrides = {}, load = 0, settleS = 900, opts = 
   if (opts.gov) m.govMode = opts.gov;
   if (opts.throttle !== undefined) m.throttle = opts.throttle;
   m.fieldClosed = true;
-  m.excCmd = opts.exc ?? 1.25;
-  m.excMode = opts.excMode ?? 'manual';
+  m.excCmd = opts.exc ?? 1.0;
   runFor(m, spec, env, 4);
   closeBreaker(m, spec, env);
   env.demandKW = load;
-  runFor(m, spec, env, settleS);
+  // An operator stands there trimming the rheostat to hold nominal volts;
+  // without that the machine simply trips out on over- or under-voltage.
+  const slice = 0.5;
+  for (let t = 0; t < settleS; t += slice) {
+    runFor(m, spec, env, Math.min(slice, settleS - t));
+    if (opts.exc === undefined) {
+      m.excCmd = Math.max(0, Math.min(spec.excMax, m.excCmd + ((480 - m.volts) / 480) * 0.35));
+    }
+  }
   return { m, spec, env };
 }
 
@@ -68,14 +75,16 @@ test('mechanical droop lets speed fall as load is added', () => {
   assert.ok(rpmToHz(light.m.rpm) > 60, 'unloaded set should run fast');
 });
 
-test('an isochronous governor holds 60.0 Hz at any load', () => {
-  for (const load of [10, 45, 75]) {
-    const { m } = running(['avr', 'govlinkage', 'isoch'], {}, load, 900, { gov: 'isoch' });
-    assert.ok(
-      Math.abs(rpmToHz(m.rpm) - 60) < 0.1,
-      `load ${load} kW settled at ${rpmToHz(m.rpm).toFixed(2)} Hz`,
-    );
-  }
+test('a hydraulic governor holds a far tighter line than a flyweight one', () => {
+  const spread = (owned) => {
+    const light = running(owned, {}, 10, 900);
+    const heavy = running(owned, {}, 70, 900);
+    return Math.abs(rpmToHz(light.m.rpm) - rpmToHz(heavy.m.rpm));
+  };
+  const stock = spread([]);
+  const hydraulic = spread(['avr', 'govlinkage', 'isoch']);
+  assert.ok(hydraulic < stock * 0.4, `droop spread ${hydraulic} vs ${stock} Hz`);
+  assert.ok(hydraulic < 0.5, `hydraulic governor still drooped ${hydraulic} Hz`);
 });
 
 test('the alternator rating caps deliverable power', () => {
@@ -93,12 +102,18 @@ test('sustained gross overload trips the breaker on under-frequency', () => {
   m.cranking = 6;
   runFor(m, spec, env, 12);
   m.fieldClosed = true;
-  m.excCmd = 1.25;
+  m.excCmd = 1.0;
   runFor(m, spec, env, 4);
   closeBreaker(m, spec, env);
   env.demandKW = 400;
   const events = runFor(m, spec, env, 30);
-  assert.ok(events.some((e) => e.type === 'trip'), 'expected an under-frequency trip');
+  const trip = events.find((e) => e.type === 'relay-trip');
+  assert.ok(trip, 'expected a protective relay to operate');
+  assert.ok(!m.breakerClosed, 'the breaker should be out');
+  assert.ok(
+    trip.relays.some((r) => r === 'underFreq' || r === 'underVolt' || r === 'overCurrent'),
+    `unexpected relays: ${trip.relays.join(',')}`,
+  );
 });
 
 test('turbo lag: boost is low at light load and builds under fuelling', () => {
@@ -135,11 +150,16 @@ test('altitude and heat both derate a naturally aspirated engine', () => {
   assert.ok(densityRatio(2400, 20) < 0.8, 'thin air at altitude');
   assert.ok(densityRatio(0, 45) < densityRatio(0, 5), 'hot air is less dense');
 
-  const sea = running([], {}, 70, 1200);
-  const alp = running([], { altitudeM: 2400 }, 70, 1200);
+  // Thin air means less of it per stroke, so the same load has to be made on a
+  // richer mixture: the air/fuel ratio is the direct read-out of the derate.
+  // 55 kW is comfortable at sea level and hard work at 2,400 m -- push it to
+  // 70 and the thin air simply will not carry it at all.
+  const sea = running([], {}, 55, 1200);
+  const alp = running([], { altitudeM: 2400 }, 55, 1200);
+  assert.ok(sea.m.breakerClosed && alp.m.breakerClosed, 'both should still be on load');
   assert.ok(
-    alp.m.smoke > sea.m.smoke || alp.m.rpm < sea.m.rpm,
-    'the same load should be harder at altitude',
+    alp.m.afr < sea.m.afr - 1,
+    `altitude should richen the mixture: ${alp.m.afr.toFixed(1)} vs ${sea.m.afr.toFixed(1)}`,
   );
 });
 
@@ -165,7 +185,7 @@ test('running out of fuel stops the engine and opens the breaker', () => {
   m.cranking = 6;
   runFor(m, spec, env, 12);
   m.fieldClosed = true;
-  m.excCmd = 1.25;
+  m.excCmd = 1.0;
   runFor(m, spec, env, 4);
   closeBreaker(m, spec, env);
   m.fuelL = 0.05;
@@ -174,16 +194,33 @@ test('running out of fuel stops the engine and opens the breaker', () => {
   assert.ok(!m.running && !m.breakerClosed);
 });
 
-test('wear accumulates faster under heavy load than light', () => {
-  const light = running([], {}, 15, 3600);
-  const heavy = running([], {}, 78, 3600);
-  assert.ok(heavy.m.wear > light.m.wear, `${heavy.m.wear} vs ${light.m.wear}`);
+test('oil pressure follows engine speed and falls away as the oil heats', () => {
+  const cold = running([], {}, 20, 30);
+  const hot = running([], {}, 78, 5400);
+  assert.ok(cold.m.oilBar > 2.5, `cold oil pressure was ${cold.m.oilBar}`);
+  assert.ok(hot.m.oilBar < cold.m.oilBar, `${hot.m.oilBar} vs ${cold.m.oilBar}`);
+  assert.ok(hot.m.oilBar > 1.0, 'a healthy engine should stay above the trip');
 });
 
-test('durability upgrades measurably slow wear', () => {
-  const stock = running([], {}, 70, 7200);
-  const tough = running(['synthoil', 'crank', 'liners'], {}, 70, 7200);
-  assert.ok(tough.m.wear < stock.m.wear * 0.75, `${tough.m.wear} vs ${stock.m.wear}`);
+test('a better oil system holds the gauge up when hot', () => {
+  const stock = running([], {}, 75, 5400);
+  const better = running(['synthoil', 'radiator', 'oilcooler'], {}, 75, 5400);
+  assert.ok(
+    better.m.oilBar > stock.m.oilBar + 0.3,
+    `${better.m.oilBar.toFixed(2)} vs ${stock.m.oilBar.toFixed(2)} bar`,
+  );
+});
+
+test('exhaust temperature tracks load', () => {
+  const light = running([], {}, 10, 900);
+  const heavy = running([], {}, 75, 900);
+  assert.ok(heavy.m.egtC > light.m.egtC + 150, `${light.m.egtC} -> ${heavy.m.egtC}`);
+  assert.ok(heavy.m.egtC > 400 && heavy.m.egtC < 750, `EGT was ${heavy.m.egtC}`);
+});
+
+test('the kWh register integrates delivered energy', () => {
+  const { m } = running([], {}, 60, 3600);
+  assert.ok(Math.abs(m.kwhRegister - 60) < 6, `register read ${m.kwhRegister}`);
 });
 
 test('the battery buffer shaves peaks above the engine comfort zone', () => {
@@ -205,7 +242,7 @@ test('results do not depend on the fast-forward timestep', () => {
   // advance() picks dt in [0.005, 0.02] depending on speed. An isochronous
   // governor is the stiffest loop in the model, so if anything is going to go
   // unstable when the player hits 600x, it is this.
-  const owned = ['intake', 'turbo', 'intercooler', 'avr', 'govlinkage', 'isoch',
+  const owned = ['intake', 'turbo', 'intercooler', 'avr', 'govlinkage',
     'synthoil', 'alloyblock', 'windings'];
   const results = [0.005, 0.01, 0.02].map((dt) => {
     const spec = buildSpec(owned, baseSpec);

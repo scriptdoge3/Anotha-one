@@ -8,7 +8,7 @@ import {
 } from '../src/contracts.js';
 import {
   createGame, acceptContract, advance, startEngine, setBreaker, refuel,
-  buyTech, doService, board, setFieldBreaker, setExcitation,
+  buyTech, board, setFieldBreaker, setExcitation,
 } from '../src/state.js';
 
 // ------------------------------------------------------------------ tech --
@@ -294,43 +294,25 @@ test('a competently run tier-1 job turns a profit end to end', () => {
   assert.ok(g.machine.hours > 7, 'should have logged engine hours');
 });
 
-test('leaving the field untrimmed costs you the power quality clause', () => {
+test('leaving the field untrimmed trips the machine off on over-voltage', () => {
   // The same job, run by someone who set the rheostat once and walked away.
+  // On a stock set there is nothing to catch that but the relays.
   const g = createGame();
   assert.ok(acceptContract(g, 't1-barn').ok);
   startEngine(g);
   advance(g, 12);
   setFieldBreaker(g, true);
-  setExcitation(g, 1.35);
-  advance(g, 4);
+  setExcitation(g, 1.45);
+  advance(g, 6);
   setBreaker(g, true);
   let guard = 0;
   while (g.job && !g.job.done && guard++ < 6000) advance(g, 20);
   assert.ok(g.job?.done);
   assert.ok(
-    g.job.progress.voltViolSec > 600,
-    'an untrimmed field should sit outside the voltage clause',
+    g.machine.relays.overVolt,
+    'an untrimmed field should have thrown the over-voltage relay',
   );
-});
-
-test('servicing costs money and removes wear', () => {
-  const g = createGame();
-  g.money = 20000;
-  g.machine.wear = 60;
-  g.machine.hoursSinceService = 400;
-  const before = g.money;
-  assert.ok(doService(g, 'top').ok);
-  assert.ok(g.machine.wear < 60);
-  assert.equal(g.machine.hoursSinceService, 0);
-  assert.ok(g.money < before);
-});
-
-test('a full rebuild returns the engine to zero wear', () => {
-  const g = createGame();
-  g.money = 50000;
-  g.machine.wear = 99;
-  doService(g, 'rebuild');
-  assert.equal(g.machine.wear, 0);
+  assert.ok(g.job.progress.outageSec > 600, 'and left the site without supply');
 });
 
 test('the balance never goes negative on settlement', () => {

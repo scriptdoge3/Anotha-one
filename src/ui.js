@@ -5,19 +5,18 @@
  */
 
 import { money, num, duration, escapeHtml, dayStamp, dateStamp } from './format.js';
-import { RATED_KW, rpmToHz, densityRatio, baseSpec, AFR_SMOKE_LIMIT, NOMINAL_V, speedSetpoint, SYNC_LIMITS } from './sim.js';
+import { RATED_KW, rpmToHz, densityRatio, baseSpec, AFR_SMOKE_LIMIT, NOMINAL_V, speedSetpoint, SYNC_LIMITS, latchedRelays, anyRelayLatched, governorDroop } from './sim.js';
 import { TECH, BRANCHES, TECH_BY_ID, canResearch, lockedBy, buildSpec } from './tech.js';
 import {
   demandAt, peakDemand, meanDemand, profileLabel, capLabel,
   missingCaps, estimateValue, TIER_REP,
 } from './contracts.js';
-import { SPEEDS, SERVICE, TANK_UPGRADE, fuelPrice, board, specFor, syncState, envFor } from './state.js';
+import { SPEEDS, TANK_UPGRADE, fuelPrice, board, specFor, syncState, envFor, RELAY_LABELS, relayLabel } from './state.js';
 
 // ------------------------------------------------------------------ topbar
 
 export function renderTop(g) {
   const m = g.machine;
-  const wearCls = m.wear > 80 ? 'bad' : m.wear > 50 ? 'warn' : '';
   const repTier = [5, 4, 3, 2, 1].find((t) => g.reputation >= TIER_REP[t]) ?? 1;
   const cell = (label, value, cls = '') =>
     `<div class="stat"><span class="stat-label">${label}</span><span class="stat-value ${cls}">${value}</span></div>`;
@@ -26,12 +25,10 @@ export function renderTop(g) {
     cell('Standing', `${g.reputation} <span style="font-size:9px;opacity:.65">T${repTier}</span>`),
     cell('Date', dateStamp(g.day)),
     cell('Run Hrs', num(m.hours, 0)),
-    cell('Wear', `${num(m.wear, 1)}%`, wearCls),
+    cell('kWh', num(m.kwhRegister ?? 0, 0)),
     cell('Fuel', `£${fuelPrice(g).toFixed(2)}`),
   ].join('');
 }
-
-// ----------------------------------------------------------------- operate
 
 /**
  * The Operate panel is the only view that changes every frame, so it is built
@@ -224,24 +221,44 @@ function meterSpecs(g) {
       bands: [{ from: 0.4, to: 1, color: RED }],
       state: m.smoke > 0.3 ? 'alarm' : m.smoke > 0.08 ? 'warn' : '',
     },
-    spec.batteryKWh > 0
-      ? {
-          key: 'batt', label: 'Battery', unit: 'PER CENT',
-          min: 0, max: 100, majors: 4, value: m.batterySoc * 100,
-          display: `${num(m.batterySoc * 100, 0)}%`,
-          sub: `${m.batteryFlowKW > 0 ? 'disch ' : m.batteryFlowKW < 0 ? 'chg ' : 'idle '}${num(Math.abs(m.batteryFlowKW), 1)} kW`,
-          bands: [{ from: 0, to: 0.15, color: RED }],
-          state: '',
-        }
-      : {
-          key: 'wear', label: 'Engine Wear', unit: 'PER CENT',
-          min: 0, max: 100, majors: 4, value: m.wear,
-          display: `${num(m.wear, 1)}%`,
-          sub: `${num(m.hoursSinceService, 0)} h since service`,
-          bands: [{ from: 0.75, to: 1, color: RED }],
-          state: m.wear > 80 ? 'alarm' : m.wear > 50 ? 'warn' : '',
-        },
+    {
+      key: 'amps', label: 'Line Current', unit: 'AMPERES',
+      min: 0, max: Math.ceil(((spec.altRatingKW * 1000) / (Math.sqrt(3) * NOMINAL_V * 0.8)) / 50) * 50 + 50,
+      majors: 4, value: m.amps ?? 0,
+      display: `${num(m.amps ?? 0, 0)} A`,
+      sub: `pf ${num(m.pf ?? 1, 2)}`,
+      state: '',
+    },
+    {
+      key: 'oil', label: 'Oil Pressure', unit: 'BAR',
+      min: 0, max: 6, majors: 6, value: m.oilBar ?? 0, tickDp: 0,
+      display: `${num(m.oilBar ?? 0, 1)} bar`,
+      sub: !m.running ? 'engine stopped' : (m.oilBar ?? 0) < 1.4 ? 'LOW — trip at 1.0' : 'normal',
+      bands: [{ from: 0, to: 1 / 6, color: RED }],
+      state: m.running && (m.oilBar ?? 0) < 1.0 ? 'alarm' : m.running && (m.oilBar ?? 0) < 1.6 ? 'warn' : '',
+    },
   ];
+
+  if (spec.fullInstruments) {
+    out.push({
+      key: 'egt', label: 'Exhaust Temp', unit: 'DEG C',
+      min: 0, max: 800, majors: 4, value: m.egtC ?? 20,
+      display: `${num(m.egtC ?? 20, 0)} °C`,
+      sub: (m.egtC ?? 0) > 620 ? 'HOT — ease the load' : 'normal',
+      bands: [{ from: 620 / 800, to: 1, color: RED }],
+      state: (m.egtC ?? 0) > 680 ? 'alarm' : (m.egtC ?? 0) > 620 ? 'warn' : '',
+    });
+  }
+  if (spec.batteryKWh > 0) {
+    out.push({
+      key: 'batt', label: 'Battery', unit: 'PER CENT',
+      min: 0, max: 100, majors: 4, value: m.batterySoc * 100,
+      display: `${num(m.batterySoc * 100, 0)}%`,
+      sub: `${m.batteryFlowKW > 0 ? 'disch ' : m.batteryFlowKW < 0 ? 'chg ' : 'idle '}${num(Math.abs(m.batteryFlowKW), 1)} kW`,
+      bands: [{ from: 0, to: 0.15, color: RED }],
+      state: '',
+    });
+  }
   if (job && !job.done && job.contract.bus) {
     const q = m.kvar ?? 0;
     const pfMin = job.contract.pfMin ?? 0.85;
@@ -292,7 +309,8 @@ function lampSpecs(g) {
     { key: 'temp', label: 'Over Temp', on: m.coolantC > 105, color: 'red' },
     { key: 'over', label: 'Load Shed', on: m.shedKW > 0.5, color: 'red' },
     { key: 'lowfuel', label: 'Low Fuel', on: fuelPct < 20, color: 'amber' },
-    { key: 'svc', label: 'Service', on: m.hoursSinceService > 250, color: 'amber' },
+    { key: 'oilamp', label: 'Oil Press', on: m.running && (m.oilBar ?? 0) < 1.6, color: 'red' },
+    { key: 'relay', label: 'Relay Target', on: anyRelayLatched(m), color: 'red' },
   ];
   if (spec.capabilities.includes('dpf')) {
     lamps.push({ key: 'dpf', label: `Filter ${num(m.dpfLoad * 100, 0)}%`, on: m.dpfLoad > 0.7, color: 'amber' });
@@ -316,8 +334,7 @@ export function operateSignature(g) {
     !!g.job?.contract.thermalPayPerKWh,
     spec.altRatingKW,      // redraws the kW scale
     spec.tankL,            // redraws the fuel scale
-    spec.isochAvailable,   // adds a governor position
-    spec.avrFitted,        // adds an excitation position
+    spec.fullInstruments,  // adds the pyrometer and oil gauge
     !!g.job?.contract.bus, // brings out the synchroscope and the kVAr meter
   ].join('|');
 }
@@ -438,24 +455,28 @@ export function renderOperate(g) {
             <div class="ctl-group">
               <div class="ctl-legend">Governor</div>
               <div class="mode-switch" data-modes="gov">
-                <button data-gov="manual">Man</button>
-                <button data-gov="droop">Droop</button>
-                <button data-gov="isoch" ${g.spec.isochAvailable ? '' : 'disabled'}>Isoch</button>
+                <button data-gov="manual">Hand Rack</button>
+                <button data-gov="droop">Governor</button>
               </div>
               <div class="lever-row">
                 <button class="nudge" data-nudge="throttle" data-step="-0.004">▼</button>
                 <input class="lever" type="range" min="0" max="1" step="0.001" data-lever="throttle"
-                  value="${g.machine.throttle}" aria-label="Throttle" />
+                  value="${g.machine.throttle}" aria-label="Speed setting" />
                 <button class="nudge" data-nudge="throttle" data-step="0.004">▲</button>
+              </div>
+              <div class="droop-row">
+                <span class="droop-label">Droop</span>
+                <button class="nudge" data-nudge="droop" data-step="-0.0025">−</button>
+                <span class="droop-val" data-f="droopRead">—</span>
+                <button class="nudge" data-nudge="droop" data-step="0.0025">+</button>
               </div>
               <div class="ctl-read" data-f="govRead">—</div>
             </div>
 
             <div class="ctl-group">
-              <div class="ctl-legend">Excitation</div>
-              <div class="mode-switch" data-modes="exc">
-                <button data-exc="manual">Hand</button>
-                <button data-exc="avr" ${g.spec.avrFitted ? '' : 'disabled'}>AVR</button>
+              <div class="ctl-legend">Field Rheostat</div>
+              <div class="ctl-row">
+                <button class="btn btn-sm" data-act="field">Field</button>
               </div>
               <div class="lever-row">
                 <button class="nudge" data-nudge="exc" data-step="-0.01">▼</button>
@@ -467,15 +488,28 @@ export function renderOperate(g) {
             </div>
 
             <div class="ctl-group">
-              <div class="ctl-legend">Breakers</div>
-              <div class="ctl-row"><button class="btn btn-sm" data-act="field">Field</button></div>
-              <div class="ctl-row"><button class="btn btn-sm" data-act="breaker">Main</button></div>
-              <div class="ctl-row" data-f="forcerow"><button class="btn btn-sm btn-danger" data-act="force-close">Force</button></div>
+              <div class="ctl-legend">Breaker Control</div>
+              <div class="ctl-row">
+                <button class="btn btn-sm btn-danger" data-act="trip">Trip</button>
+                <button class="btn btn-sm" data-act="close">Close</button>
+              </div>
+              <div class="ctl-row" data-f="forcerow">
+                <button class="btn btn-sm btn-danger" data-act="force-close">Force Close</button>
+              </div>
               <div class="ctl-read" data-f="brkRead">—</div>
             </div>
 
           </div>
           <div class="lamp-row">${lamps}</div>
+          <div class="relay-board">
+            <div class="relay-legend">Protective Relays</div>
+            <div class="relay-flags">
+              ${Object.keys(RELAY_LABELS)
+                .map((k) => `<span class="relay-flag" data-relay="${k}">${RELAY_LABELS[k]}</span>`)
+                .join('')}
+            </div>
+            <button class="btn btn-sm" data-act="reset-relays">Reset Board</button>
+          </div>
         </div>
       </div>
 
@@ -570,9 +604,6 @@ export function updateOperate(g, root, dt = 1 / 60) {
   for (const b of root.querySelectorAll('[data-modes="gov"] button')) {
     b.classList.toggle('is-on', b.dataset.gov === m.govMode);
   }
-  for (const b of root.querySelectorAll('[data-modes="exc"] button')) {
-    b.classList.toggle('is-on', b.dataset.exc === m.excMode);
-  }
 
   // Levers are the operator's hand: only write back when they are not holding
   // it, otherwise the value fights the drag.
@@ -594,17 +625,17 @@ export function updateOperate(g, root, dt = 1 / 60) {
       ? `${num(m.throttle * 100, 1)}% lever · ${rackPct}`
       : `set ${num(speedSetpoint(m.throttle), 0)} rpm · ${rackPct}`);
 
+  setText('[data-f="droopRead"]', `${num(governorDroop(m, spec) * 100, 2)}%`);
+
   setText('[data-f="excRead"]',
-    !m.fieldClosed
-      ? 'field open'
-      : m.excMode === 'avr'
-        ? `AVR · ${num(m.exc, 2)} pu`
-        : `${num(m.excCmd, 2)} pu set · ${num(m.exc, 2)} actual`);
+    !m.fieldClosed ? 'field open' : `${num(m.excCmd, 2)} pu set · ${num(m.exc, 2)} actual`);
 
   const sync = syncState(g);
+  const locked = anyRelayLatched(m);
   setText('[data-f="brkRead"]',
     m.breakerClosed
       ? (m.synced ? `on bus · ${num(m.delta, 0)}°` : 'closed on load')
+      : locked ? 'relay target standing'
       : sync.ok ? 'ready to close' : (sync.reason ?? 'not ready'));
 
   setBtn('[data-act="field"]', {
@@ -612,17 +643,26 @@ export function updateOperate(g, root, dt = 1 / 60) {
     text: m.fieldClosed ? 'Field Off' : 'Field On',
     cls: `btn btn-sm ${m.fieldClosed ? 'btn-danger' : ''}`,
   });
-  setBtn('[data-act="breaker"]', {
-    disabled: (!m.running && m.cranking <= 0) || (!m.breakerClosed && !sync.ok && !!bus),
-    text: m.breakerClosed ? 'Open' : 'Close',
-    cls: `btn btn-sm ${m.breakerClosed ? 'btn-danger' : sync.ok ? 'btn-primary' : ''}`,
+  setBtn('[data-act="trip"]', { disabled: !m.breakerClosed });
+  setBtn('[data-act="close"]', {
+    disabled: m.breakerClosed || locked || !sync.ok,
+    cls: `btn btn-sm ${!m.breakerClosed && sync.ok && !locked ? 'btn-primary' : ''}`,
   });
-  // Forcing a close is only possible without a check-sync relay to stop you.
   const forceRow = root.querySelector('[data-f="forcerow"]');
   if (forceRow) {
-    const show = !!bus && !m.breakerClosed && !sync.ok && !spec.checkSync && m.running;
+    const show = !!bus && !m.breakerClosed && !sync.ok && !locked && !spec.checkSync && m.running;
     forceRow.style.display = show ? '' : 'none';
   }
+
+  // Relay targets: latched flags that have to be reset by hand.
+  const standing = new Set(latchedRelays(m));
+  for (const el of root.querySelectorAll('[data-relay]')) {
+    el.classList.toggle('is-out', standing.has(el.dataset.relay));
+  }
+  setBtn('[data-act="reset-relays"]', {
+    disabled: standing.size === 0,
+    cls: `btn btn-sm ${standing.size ? 'btn-primary' : ''}`,
+  });
 
   // ---- synchroscope ----------------------------------------------------
   if (bus) {
@@ -1029,23 +1069,7 @@ function specDeltaRows(before, after) {
 export function renderWorkshop(g) {
   const m = g.machine;
   const spec = g.spec;
-  const hasTelemetry = spec.capabilities.includes('telemetry');
   const busy = !!g.job && !g.job.done;
-
-  const services = Object.values(SERVICE).map((s) => {
-    const cost = hasTelemetry ? s.telemetryCost : s.cost;
-    return `<div class="card"><div class="card-body shop-item">
-      <div>
-        <div class="job-title">${s.name}</div>
-        <div class="faint mono" style="font-size:11px">${s.hours} h downtime</div>
-      </div>
-      <div class="shop-desc">${s.desc}</div>
-      <div class="row" style="justify-content:space-between;margin-top:auto">
-        <span class="mono">${money(cost)}${hasTelemetry ? ' <span class="faint" style="font-size:10px">telemetry rate</span>' : ''}</span>
-        <button class="btn btn-sm ${g.money >= cost && !busy ? 'btn-primary' : ''}" data-service="${s.id}" ${g.money >= cost && !busy ? '' : 'disabled'}>Book in</button>
-      </div>
-    </div></div>`;
-  }).join('');
 
   const tank = `<div class="card"><div class="card-body shop-item">
     <div><div class="job-title">${TANK_UPGRADE.name}</div>
@@ -1076,10 +1100,15 @@ export function renderWorkshop(g) {
     ['Rated (plate)', `${RATED_KW} kW`],
     ['Indicated efficiency', `${num(spec.indicatedEff * 100, 1)}%`],
     ['Induction', spec.boostGain > 0 ? `Turbocharged (+${num(spec.boostGain * 100, 0)}% air, τ ${num(spec.boostTau, 2)} s)` : 'Naturally aspirated'],
-    ['Governor', spec.isochronous ? 'Isochronous electronic' : `Mechanical, ${num(spec.droop * 100, 1)}% droop`],
-    ['Voltage regulation', `±${num(spec.voltSag * 100, 1)}% sag at full load`],
+    ['Governor', `${spec.droop <= 0.006 ? 'Hydraulic' : 'Flyweight'}, ${num(spec.droop * 100, 1)}% droop`],
+    ['Excitation', spec.compounded > 0
+      ? `Hand rheostat, compounded ${num(spec.compounded * 100, 0)}%`
+      : 'Hand rheostat'],
+    ['Volts lost at full load', `${num(Math.max(0, spec.armatureReaction - spec.compounded) * 100, 0)}%`],
+    ['Rack limiter', spec.aneroid ? 'Aneroid boost compensator' : 'Mechanical stop'],
+    ['Oil pressure (rated)', `${num(spec.oilPressureRated, 1)} bar`],
     ['Cooling', `${num(spec.radiatorUA, 0)} W/K${spec.fanVariable ? ', variable fan' : ', fixed fan'}`],
-    ['Durability', `×${num(spec.durability, 2)}`],
+    ['Instruments', spec.fullInstruments ? 'Full switchboard' : 'Basic (V, Hz, A)'],
     ['Noise at 7 m', `${num(spec.noiseDb, 0)} dB(A)`],
     ['Emissions', `Stage ${spec.emissionsTier}`],
     ['Fuel', spec.fuel.toUpperCase()],
@@ -1089,6 +1118,7 @@ export function renderWorkshop(g) {
   ].map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('');
 
   const career = [
+    ['Energy registered', `${num(m.kwhRegister ?? 0, 0)} kWh`],
     ['Contracts completed', g.completed.length],
     ['Clean runs', g.cleanRuns],
     ['Failed jobs', g.failedJobs],
@@ -1100,10 +1130,10 @@ export function renderWorkshop(g) {
 
   return `
     <div class="stack">
-      ${busy ? '<div class="card"><div class="card-body"><span class="chip warn">A job is running — servicing and upgrades are unavailable until it ends.</span></div></div>' : ''}
+      ${busy ? '<div class="card"><div class="card-body"><span class="chip warn">A job is running — upgrades are unavailable until it ends.</span></div></div>' : ''}
       <div>
-        <h2 class="section-title">Maintenance &amp; Consumables</h2>
-        <div class="shop-grid">${services}${tank}${fuelBuy}</div>
+        <h2 class="section-title">Consumables</h2>
+        <div class="shop-grid">${tank}${fuelBuy}</div>
       </div>
       <div class="shop-grid">
         <div class="card">

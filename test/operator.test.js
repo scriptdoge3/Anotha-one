@@ -2,13 +2,27 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   baseSpec, newMachine, defaultEnv, step, runFor, rpmToHz, wrapDeg,
-  closeBreaker, forceCloseBreaker, syncCheck, speedSetpoint,
+  closeBreaker, forceCloseBreaker, syncCheck, speedSetpoint, throttleForSpeed,
+  latchedRelays, anyRelayLatched, resetRelays as simResetRelays,
   AFR_SMOKE_LIMIT, OVERSPEED_TRIP, NOMINAL_RPM,
 } from '../src/sim.js';
 import { buildSpec } from '../src/tech.js';
-import { createGame, setGovMode, setExcMode, envFor } from '../src/state.js';
+import { createGame, setGovMode, envFor, resetRelays } from '../src/state.js';
 
 const BUS = { hz: 60, volts: 480 };
+
+/** Lever position that gives `hz` off load, allowing for governor droop. */
+function leverFor(hz, spec) {
+  return throttleForSpeed(((hz / 60) * 1800) / (1 + spec.droop));
+}
+
+/** Trim the rheostat towards nominal volts, the way an operator does. */
+function holdVolts(m, spec, env, seconds, target = 480) {
+  for (let t = 0; t < seconds; t += 0.5) {
+    runFor(m, spec, env, 0.5);
+    m.excCmd = Math.max(0, Math.min(spec.excMax, m.excCmd + ((target - m.volts) / 480) * 0.35));
+  }
+}
 
 function boot(owned = [], envOverrides = {}) {
   const spec = buildSpec(owned, baseSpec);
@@ -77,43 +91,21 @@ test('an unregulated machine loses volts under load and must be trimmed by hand'
   assert.ok(m.volts > loaded + 60, `hand trim should recover volts, got ${m.volts}`);
 });
 
-test('the AVR holds voltage across the load range without help', () => {
-  const { m, spec, env } = excited(['avr']);
-  m.excMode = 'avr';
-  runFor(m, spec, env, 5);
-  closeBreaker(m, spec, env);
-  for (const load of [0, 35, 70]) {
-    env.demandKW = load;
-    runFor(m, spec, env, 40);
-    assert.ok(
-      Math.abs(m.volts - 480) < 12,
-      `AVR let volts reach ${m.volts.toFixed(0)} at ${load} kW`,
-    );
-  }
-});
-
-test('the AVR is only selectable once one is fitted', () => {
-  const g = createGame();
-  assert.equal(setExcMode(g, 'avr').ok, false);
-  g.owned.push('avr');
-  g.spec = buildSpec(g.owned, baseSpec);
-  assert.ok(setExcMode(g, 'avr').ok);
-});
-
 // -------------------------------------------------------------- governing --
 
-test('the throttle maps to a speed setpoint the governor holds', () => {
-  assert.equal(speedSetpoint(0.75), 1800);
+test('the lever sets the governor speed, and the governor droops from it', () => {
+  assert.equal(speedSetpoint(0.5), 1800);
   assert.ok(speedSetpoint(0) < speedSetpoint(1));
-  for (const t of [0.7, 0.75, 0.8]) {
+  for (const t of [0.35, 0.5, 0.65]) {
     const { m, spec, env } = excited(['avr', 'govlinkage', 'isoch']);
-    m.excMode = 'avr';
-    m.govMode = 'isoch';
+    m.govMode = 'droop';
     m.throttle = t;
     runFor(m, spec, env, 30);
+    // Off load a droop governor sits above its setpoint, by definition.
+    const expected = speedSetpoint(t) * (1 + spec.droop);
     assert.ok(
-      Math.abs(m.rpm - speedSetpoint(t)) < 6,
-      `throttle ${t} wanted ${speedSetpoint(t)} rpm, held ${m.rpm.toFixed(0)}`,
+      Math.abs(m.rpm - expected) < 8,
+      `lever ${t} wanted about ${expected.toFixed(0)} rpm, held ${m.rpm.toFixed(0)}`,
     );
   }
 });
@@ -171,13 +163,13 @@ function advanceYard(g, seconds) {
 // -------------------------------------------------------------------- AFR --
 
 test('AFR runs lean at light load and reaches the smoke limit at full rack', () => {
-  const { m, spec, env } = excited([], {}, 1.3);
+  const { m, spec, env } = excited();
   closeBreaker(m, spec, env);
   env.demandKW = 8;
-  runFor(m, spec, env, 60);
+  holdVolts(m, spec, env, 60);
   const light = m.afr;
   env.demandKW = 78;
-  runFor(m, spec, env, 90);
+  holdVolts(m, spec, env, 90);
   const heavy = m.afr;
   assert.ok(light > 60, `light load should be very lean, got ${light.toFixed(1)}`);
   assert.ok(heavy > 15 && heavy < 22, `full load should sit near the limit, got ${heavy.toFixed(1)}`);
@@ -186,10 +178,10 @@ test('AFR runs lean at light load and reaches the smoke limit at full rack', () 
 
 test('sooting only happens below the smoke limit', () => {
   const owned = ['intake', 'turbo', 'intercooler', 'compound', 'synthoil', 'alloyblock', 'windings', 'crank'];
-  const { m, spec, env } = excited(owned, {}, 1.3);
+  const { m, spec, env } = excited(owned);
   closeBreaker(m, spec, env);
   env.demandKW = 15;
-  runFor(m, spec, env, 120);
+  holdVolts(m, spec, env, 120);
   env.demandKW = spec.altRatingKW;
   let sawSmoke = false;
   let afrAtSmoke = 99;
@@ -208,30 +200,31 @@ test('sooting only happens below the smoke limit', () => {
 
 test('the synchroscope needle turns once per beat of slip', () => {
   const { m, spec, env } = excited(['avr', 'govlinkage', 'isoch', 'parallel'], { bus: BUS });
-  m.excMode = 'avr';
-  m.govMode = 'isoch';
-  m.throttle = ((60.5 / 60) * 1800 - 1500) / 400;
+  m.govMode = 'droop';
+  m.throttle = leverFor(60.5, spec);
   runFor(m, spec, env, 20);
   assert.ok(Math.abs(m.slipHz - 0.5) < 0.05, `slip was ${m.slipHz}`);
 
   // Over one full revolution's worth of time the needle should come back round.
   const start = m.syncAngle;
-  runFor(m, spec, env, 1 / 0.5);
-  assert.ok(Math.abs(wrapDeg(m.syncAngle - start)) < 12, 'needle should return to the mark');
+  runFor(m, spec, env, 1 / Math.abs(m.slipHz));
+  assert.ok(
+    Math.abs(wrapDeg(m.syncAngle - start)) < 15,
+    `needle should return to the mark, ended ${wrapDeg(m.syncAngle - start).toFixed(0)} off`,
+  );
 });
 
 test('a matched machine may close; an unmatched one may not', () => {
   const { m, spec, env } = excited(['avr', 'govlinkage', 'isoch', 'parallel'], { bus: BUS });
-  m.excMode = 'avr';
-  m.govMode = 'isoch';
+  m.govMode = 'droop';
 
   // Far too fast: refused on slip.
-  m.throttle = ((63 / 60) * 1800 - 1500) / 400;
+  m.throttle = leverFor(63, spec);
   runFor(m, spec, env, 20);
   assert.equal(syncCheck(m, env).ok, false);
 
   // Creep it in and wait for the mark.
-  m.throttle = ((60.2 / 60) * 1800 - 1500) / 400;
+  m.throttle = leverFor(60.2, spec);
   runFor(m, spec, env, 15);
   let waited = 0;
   let closed = false;
@@ -247,8 +240,8 @@ test('a matched machine may close; an unmatched one may not', () => {
 
 test('voltage must match the bus too, not just speed and phase', () => {
   const { m, spec, env } = excited(['avr', 'govlinkage', 'isoch', 'parallel'], { bus: BUS }, 1.45);
-  m.govMode = 'isoch';
-  m.throttle = ((60.2 / 60) * 1800 - 1500) / 400;
+  m.govMode = 'droop';
+  m.throttle = leverFor(60.2, spec);
   runFor(m, spec, env, 15);
   assert.ok(m.volts > 560, `field left high, ${m.volts.toFixed(0)} V`);
 
@@ -269,33 +262,36 @@ test('voltage must match the bus too, not just speed and phase', () => {
 
 test('closing out of phase is violent and throws the set off line', () => {
   const { m, spec, env } = excited(['avr', 'govlinkage', 'isoch'], { bus: BUS });
-  m.excMode = 'avr';
   runFor(m, spec, env, 4);
   // Walk round to roughly antiphase.
   let guard = 0;
   while (Math.abs(wrapDeg(m.phase - m.busPhase)) < 168 && guard++ < 400000) {
     step(m, spec, env, 0.002);
   }
-  const before = m.wear;
   const res = forceCloseBreaker(m, spec, env);
   assert.ok(res.shock, 'should report a shock');
   assert.ok(res.severity > 0.8, `severity ${res.severity}`);
-  assert.ok(m.wear > before + 10, `wear ${before} -> ${m.wear}`);
   assert.ok(!m.breakerClosed, 'a bad close should throw the breaker straight back out');
+  assert.ok(
+    latchedRelays(m).includes('overCurrent'),
+    `expected an overcurrent target, got ${latchedRelays(m).join(',') || 'none'}`,
+  );
+  // And it stays locked out until the board is walked.
+  assert.equal(closeBreaker(m, spec, env).ok, false);
+  simResetRelays(m);
+  assert.ok(!anyRelayLatched(m));
 });
 
 test('the check-sync relay refuses the close instead of letting you break things', () => {
   const { m, spec, env } = excited(['avr', 'govlinkage', 'isoch', 'parallel'], { bus: BUS });
-  m.excMode = 'avr';
-  m.govMode = 'isoch';
-  m.throttle = ((62.5 / 60) * 1800 - 1500) / 400;
+  m.govMode = 'droop';
+  m.throttle = leverFor(62.5, spec);
   runFor(m, spec, env, 20);
-  const before = m.wear;
   const res = closeBreaker(m, spec, env);
   assert.equal(res.ok, false);
   assert.ok(res.blocked, 'the relay should say it blocked it');
   assert.equal(m.breakerClosed, false);
-  assert.equal(m.wear, before, 'nothing should have been damaged');
+  assert.ok(!anyRelayLatched(m), 'nothing should have operated');
 });
 
 // --------------------------------------------------------------- on a bus --
@@ -304,7 +300,7 @@ test('the check-sync relay refuses the close instead of letting you break things
 function onBus(owned, { exc = 1.0, gov = 'droop' } = {}) {
   const { m, spec, env } = excited(owned, { bus: BUS }, exc);
   m.govMode = gov;
-  m.throttle = ((60.2 / 60) * 1800 / (gov === 'droop' ? 1 + spec.droop : 1) - 1500) / 400;
+  m.throttle = leverFor(60.2, spec);
   runFor(m, spec, env, 15);
   let waited = 0;
   while (waited < 90 && !m.synced) {
@@ -318,18 +314,21 @@ function onBus(owned, { exc = 1.0, gov = 'droop' } = {}) {
 test('on a bus the frequency is the bus, whatever the throttle does', () => {
   const { m, spec, env } = onBus(['avr', 'govlinkage', 'isoch', 'parallel', 'synthoil', 'alloyblock', 'windings']);
   assert.ok(m.synced, 'should be synchronised');
-  for (const t of [0.70, 0.74, 0.755]) {
-    m.throttle = t;
+  const base = leverFor(60, spec);
+  for (const d of [0.02, 0.06, 0.10]) {
+    m.throttle = base + d;
     runFor(m, spec, env, 20);
-    assert.ok(Math.abs(m.hz - BUS.hz) < 0.02, `throttle ${t} moved frequency to ${m.hz}`);
+    assert.ok(m.synced, `fell off the bus at lever +${d}`);
+    assert.ok(Math.abs(m.hz - BUS.hz) < 0.02, `lever +${d} moved frequency to ${m.hz}`);
   }
 });
 
 test('on a bus the throttle sets real power', () => {
   const { m, spec, env } = onBus(['avr', 'govlinkage', 'isoch', 'parallel', 'synthoil', 'alloyblock', 'windings']);
+  const base = leverFor(60, spec);
   const seen = [];
-  for (const t of [0.70, 0.73, 0.75]) {
-    m.throttle = t;
+  for (const d of [0.02, 0.06, 0.10]) {
+    m.throttle = base + d;
     runFor(m, spec, env, 25);
     seen.push(m.deliveredKW);
   }
@@ -340,7 +339,7 @@ test('on a bus the throttle sets real power', () => {
 
 test('on a bus the excitation sets reactive power, not voltage', () => {
   const { m, spec, env } = onBus(['avr', 'govlinkage', 'isoch', 'parallel', 'synthoil', 'alloyblock', 'windings']);
-  m.throttle = 0.74;
+  m.throttle = leverFor(60, spec) + 0.06;
   runFor(m, spec, env, 25);
   const readings = [];
   for (const exc of [0.95, 1.25, 1.55]) {
@@ -359,22 +358,11 @@ test('on a bus the excitation sets reactive power, not voltage', () => {
   assert.ok(spread < 12, `field should barely touch real power, moved ${spread.toFixed(1)} kW`);
 });
 
-test('the AVR holds power factor once tied to a bus', () => {
-  const { m, spec, env } = onBus(['avr', 'govlinkage', 'isoch', 'parallel', 'synthoil', 'alloyblock', 'windings']);
-  m.excMode = 'avr';
-  for (const t of [0.72, 0.74, 0.75]) {
-    m.throttle = t;
-    runFor(m, spec, env, 40);
-    assert.ok(m.pf > 0.9, `power factor fell to ${m.pf.toFixed(3)}`);
-  }
-});
-
 test('overloading past pull-out slips a pole and trips off the bus', () => {
-  const { m, spec, env } = onBus(['avr', 'govlinkage', 'isoch', 'parallel'], { gov: 'isoch' });
+  const { m, spec, env } = onBus(['avr', 'govlinkage', 'isoch', 'parallel'], { gov: 'droop' });
   assert.ok(m.synced);
-  // An isochronous governor on a stiff bus winds the rack wide open, drives the
-  // load angle past 90 degrees and loses synchronism. This is exactly why sets
-  // are run in droop when paralleled.
+  // Wind the speed setting right up and the droop governor takes the rack to
+  // its stop, driving the load angle past 90 degrees.
   m.throttle = 1;
   const events = runFor(m, spec, env, 40);
   assert.ok(events.some((e) => e.type === 'pole-slip'), 'expected a pole slip');

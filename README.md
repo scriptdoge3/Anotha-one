@@ -9,15 +9,21 @@ back into it. Thirty-two upgrades across five branches take it from a naturally
 aspirated, hand-excited unit with a flyweight governor to a compound-turbocharged,
 isochronous, Stage V combined-heat-and-power machine delivering 132 kW.
 
-Nothing starts itself. You crank the engine, close the field breaker, wind the
-excitation up until the voltmeter reads 480, close the main breaker onto the
-load — and then keep trimming the field as load comes and goes, because a
-synchronous machine with no AVR loses close to a third of its terminal volts
-between no load and full load. Automation is something you buy.
+Nothing on this machine regulates itself, and nothing ever will. There is no
+automatic voltage regulator and no isochronous governor: the field is a
+rheostat, the speed is whatever the governor droop and your hand on the setting
+make it, and a synchronous machine left alone loses close to a third of its
+terminal volts between no load and full load. You crank it, close the field
+breaker, wind the volts up to 480, close the main breaker — and then keep
+trimming as the load comes and goes.
+
+What protects the plant is a bank of protective relays. Every one of them
+latches its target when it operates, and nothing closes again until you have
+walked the board and reset it.
 
 ```bash
 npm start      # http://localhost:8080
-npm test       # 68 tests over the physics, the operator controls and the career
+npm test       # 65 tests over the physics, the operator controls and the career
 npm run apk    # build load-bank.apk  (needs ANDROID_SDK_ROOT)
 ```
 
@@ -65,17 +71,36 @@ out of the model rather than being special-cased. Tied to a bus, the frequency
 and voltage are the bus's to hold; what you are accountable for is how much real
 power you export and how much reactive power you push into it.
 
-**Governor selector.** `MANUAL` puts your hand directly on the fuel rack, and
-nothing at all holds the speed — drop the load with the rack open and the engine
-runs away into the overspeed trip. `DROOP` is the flyweight governor: speed falls
-as load rises, which is exactly what lets several sets share a bus. `ISOCH` holds
-the speed you set at any load, once you have bought an electronic governor. Mode
-changes are bumpless: the new mode takes over holding the rack where it already
-is.
+**Governor.** `HAND RACK` puts your hand directly on the fuel rack, and nothing
+at all holds the speed — drop the load with the rack open and the engine runs
+away into the overspeed trip. `GOVERNOR` is the flyweight unit: speed falls as
+load rises. Changing between them is bumpless, the new mode taking over holding
+the rack where it already is.
 
-**Excitation selector.** `HAND` is the field rheostat. `AVR` is automatic, once
-fitted — and on a bus it regulates power factor rather than voltage, because
-voltage is no longer yours to set.
+The **droop setting** is a control in its own right, because it has to be. Tight
+droop holds frequency hard on an island. Wide droop is what lets a machine share
+load on a bus without the rack slamming between its stops — at half a percent
+droop, the entire load range of a machine tied to a stiff bus lives inside nine
+rpm of the speed setting. A flyweight governor will go no tighter than 3%; the
+hydraulic governor opens the range down to 0.5%.
+
+**Field rheostat.** The only thing driving the excitation is your hand on it.
+Series compounding, when fitted, feeds load current back into the exciter and
+cancels most of the sag passively — it is a transformer, not a regulator, so you
+still set the volts yourself, there is just far less chasing.
+
+**Protective relays.** Under and over frequency, under and over volts,
+inverse-time overcurrent, reverse power, low oil pressure, and the mechanical
+overspeed. Each drops its target and stays dropped. Reverse power matters the
+moment you are on a bus: let the speed setting fall and the bus starts motoring
+your set, and the relay throws it off line. Low oil pressure shuts the engine
+down outright.
+
+**Instruments.** A stock board gives you frequency, volts, amps, kilowatts,
+coolant, fuel, rack position and stack opacity. The full switchboard adds an
+exhaust pyrometer, a proper oil pressure gauge and an integrating kWh register.
+Oil pressure is not decoration: it falls as the oil thins with heat, and below
+1 bar the relay shuts the engine down.
 
 **Air/fuel ratio.** The AFR meter reads the balance the smoke limiter is already
 enforcing. Full rack on a healthy naturally aspirated six lands at 17.5:1, which
@@ -94,9 +119,7 @@ that simply refuses the close; without one, there is nothing between you and the
 bang.
 
 Hold too much load on a bus and the load angle walks past 90°, the machine slips
-a pole and drops off line. That is also why an isochronous governor is the wrong
-choice when paralleled — it winds the rack wide open trying to raise a frequency
-the bus is holding down.
+a pole and drops off line — with an overcurrent target standing to show for it.
 
 ## The machine is actually simulated
 
@@ -129,8 +152,9 @@ being scripted:
   more shaft power than the windings will pass. Until you rewind it, that power
   is unsellable.
 - **Voltage regulation is genuinely bad by hand.** Terminal volts are the internal
-  EMF minus armature reaction, so they sag with load. The AVR upgrade is not a
-  stat bump; it is the end of a chore.
+  EMF minus armature reaction, so they sag with load — far enough, if you close
+  onto a heavy load with the field still set for no load, to bring the
+  under-voltage relay in before you can wind it out.
 - **Paralleled machines swing.** The rotor is held to the bus by synchronising
   torque and damper windings, so a load change sets up a real ~1.5 Hz swing that
   settles out, and too much load pulls it out of step entirely.
@@ -145,9 +169,9 @@ Five branches, 32 nodes, one either/or fork.
 | Branch | What it buys you |
 | --- | --- |
 | **Air & Fuel** | Turbocharging, intercooling, common rail. Raw output and cleaner combustion. |
-| **Materials** | Durability, bottom-end strength, and the alternator rewind that lifts the electrical ceiling. |
+| **Materials** | Bottom-end strength, oil pressure, ring seal, and the alternator rewind that lifts the electrical ceiling. |
 | **Thermal** | Cooling headroom, then waste-heat recovery and CHP — selling the heat you were throwing away. |
-| **Control** | AVR, isochronous governing, paralleling switchgear, load anticipation, hybrid battery buffer. |
+| **Control** | Compound exciter, hydraulic governor, paralleling switchgear, aneroid boost compensator, hybrid battery buffer, full switchboard instruments. |
 | **Compliance** | Acoustic canopy, DPF, SCR, HVO. Unlocks urban, hospital and municipal work. |
 
 **Variable-Geometry Turbo** and **Compound Turbocharging** lock each other out
@@ -179,14 +203,16 @@ excursions and visible smoke. Penalties are capped at the contract's value, so
 one bad night is a setback rather than a dead save. Clients you do well by call
 again as repeat business.
 
-Wear accumulates with load, heat, soot and abrasive sites, divided by whatever
-durability you have bought. A stock engine reaches overhaul somewhere around 500
-to 900 running hours.
+There is no wear meter and no servicing. The machine does not quietly decay in
+the background — what punishes you is the shift you are actually working: volts
+out of band, supply not delivered, soot over the site, and relays on the floor
+because you were not watching the board.
 
 ## Controls
 
-Arrow up/down trims the throttle, shift+arrows trims the field, alt for fine
-steps. The raise/lower switches beside each lever repeat while held. Space
+The speed lever spans 58 to 62 Hz and nothing else, because that is the only
+range a genset lever needs to reach. Arrow up/down trims it, shift+arrows trims
+the field, alt for fine steps. The raise/lower switches beside each lever repeat while held. Space
 pauses; `1`–`6` set the time scale from 1× to 600×. The simulation is
 timestep-independent across that whole range — there is a test for it, because a
 governor loop that went unstable at 600× would quietly invent penalties.
@@ -231,7 +257,7 @@ src/main.js        frame loop and event wiring
 fonts.css          embedded period typefaces (base64, OFL)
 android/           manifest, resources and the WebView Activity
 scripts/           APK build, browser smoke test, mobile layout check
-test/              68 tests
+test/              65 tests
 ```
 
 Beyond the unit tests there are three browser checks (all need `npm i` and a
@@ -242,10 +268,12 @@ by hand — manual start, hand voltage trim, then synchronising onto a live bus 
 sweeping throttle against field to confirm they really do control kW and kVAr.
 
 The physics core is pure and deterministic, which is why the interesting
-properties are testable at all: that BSFC lands in the real range, that an
-isochronous governor holds 60.00 Hz at any load, that smoke only ever appears
+properties are testable at all: that BSFC lands in the real range, that a
+hydraulic governor droops four times tighter than a flyweight one, that oil
+pressure falls as the oil heats, that smoke only ever appears
 below 17.5:1, that the synchroscope turns once per beat of slip, that an
-out-of-phase close does real damage while the check-sync relay prevents it, that
+out-of-phase close throws the overcurrent relay and locks the breaker out until
+the board is reset, while a check-sync relay prevents it happening at all, that
 throttle and field swap roles the moment you tie to a bus, that fast-forward
 doesn't change the answer, and that no legal combination of upgrades produces a
 degenerate machine.

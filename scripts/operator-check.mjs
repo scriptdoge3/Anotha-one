@@ -30,6 +30,7 @@ const read = () => page.evaluate(() => {
     kvar: +(m.kvar ?? 0).toFixed(1), pf: +(m.pf ?? 1).toFixed(3), afr: +(m.afr ?? 0).toFixed(1),
     exc: +(m.exc ?? 0).toFixed(2), gov: m.govMode, excMode: m.excMode,
     slip: +(m.slipHz ?? 0).toFixed(3), scope: Math.round(m.syncAngle ?? 0), delta: +(m.delta ?? 0).toFixed(1),
+    droop: +(m.droopSet ?? 0).toFixed(4), relays: (Object.entries(m.relays||{}).filter(([,v])=>v).map(([k])=>k).join(',') || 'none'),
   };
 });
 const set = (what, v) => page.evaluate(([w, val]) => {
@@ -52,7 +53,7 @@ await page.click('[data-act="field"]');
 await page.waitForTimeout(900);
 console.log('field closed ', JSON.stringify(await read()));
 
-await page.click('[data-act="breaker"]');
+await page.click('[data-act="close"]');
 await page.waitForTimeout(1500);
 console.log('on load      ', JSON.stringify(await read()));
 
@@ -79,7 +80,7 @@ await page.waitForTimeout(400);
 // ------------------------------------------------------------------ bus --
 console.log('\n--- bus job: synchronise on the scope ---');
 // Shut down properly before moving to the next job.
-await page.click('[data-act="breaker"]');
+await page.click('[data-act="trip"]');
 await page.waitForTimeout(200);
 await page.click('[data-act="field"]');
 await page.waitForTimeout(200);
@@ -107,17 +108,17 @@ await page.click('[data-act="start"]');
 await page.waitForTimeout(1200);
 await page.click('[data-act="field"]');
 await page.waitForTimeout(400);
-console.log('AVR selectable:', await page.evaluate(() =>
-  !document.querySelector('[data-exc="avr"]').disabled));
-await page.click('[data-exc="avr"]');
-await page.waitForTimeout(200);
 await page.click('[data-gov="droop"]');
 await page.waitForTimeout(1500);
 
 // Set the machine a touch fast so the needle creeps round to the mark.
+// Set the governor droop first, then the speed, allowing for that droop.
 await page.evaluate(() => {
   const g = window.game();
-  g.machine.throttle = ((60.25 / 60) * 1800 / (1 + g.spec.droop) - 1500) / 400;
+  g.machine.droopSet = 0.03;
+  const droop = Math.min(0.06, Math.max(g.spec.droopMin, g.machine.droopSet));
+  const rpm = ((60.25 / 60) * 1800) / (1 + droop);
+  g.machine.throttle = Math.max(0, Math.min(1, (rpm - 1740) / 120));
 });
 await page.waitForTimeout(1500);
 // Match the bus volts as well as its speed -- the check-sync relay wants both.
@@ -135,10 +136,10 @@ await page.screenshot({ path: `${OUT}/02-synchroscope.png`, fullPage: true });
 let closed = false;
 for (let i = 0; i < 200 && !closed; i++) {
   const ready = await page.evaluate(() => {
-    const b = document.querySelector('[data-act="breaker"]');
+    const b = document.querySelector('[data-act="close"]');
     return b && !b.disabled;
   });
-  if (ready) { await page.click('[data-act="breaker"]'); closed = true; }
+  if (ready) { await page.click('[data-act="close"]'); closed = true; }
   else await page.waitForTimeout(100);
 }
 await page.waitForTimeout(800);
@@ -147,19 +148,19 @@ console.log('closed       ', JSON.stringify(onBus));
 
 // On the bus: throttle should move kW, field should move kVAr.
 const sweep = [];
-for (const t of [0.70, 0.73, 0.75]) {
-  await set('throttle', t);
+const base = await page.evaluate(() => window.game().machine.throttle);
+for (const d of [0.0, 0.05, 0.10]) {
+  await set('throttle', base + d);
   await page.waitForTimeout(900);
   const s = await read();
-  sweep.push(`th ${t} -> ${s.kw} kW @ ${s.hz} Hz`);
+  sweep.push(`+${d.toFixed(2)} -> ${s.kw} kW @ ${s.hz} Hz`);
 }
 console.log('throttle sweep:', sweep.join(' | '));
 
 // Back off the load before sweeping the field: hold 70+ kW on a 92 kW machine
 // and winding the field DOWN will drag it past pull-out, which is correct but
 // not what we are measuring here.
-await page.click('[data-exc="manual"]');
-await set('throttle', 0.72);
+await set('throttle', await page.evaluate(() => window.game().machine.throttle) - 0.05);
 await page.waitForTimeout(1200);
 const qs = [];
 for (const e of [1.0, 1.3, 1.6]) {

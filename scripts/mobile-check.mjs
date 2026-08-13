@@ -37,8 +37,11 @@ for (const [name, width, height] of sizes) {
   await page.click('[data-accept="t1-barn"]');
   await page.waitForTimeout(200);
   await page.click('[data-act="start"]');
-  await page.click('[data-act="breaker"]');
-  await page.waitForTimeout(1800);
+  await page.waitForTimeout(1400);
+  await page.click('[data-act="field"]');
+  await page.waitForTimeout(900);
+  await page.click('[data-act="close"]', { force: true });
+  await page.waitForTimeout(900);
 
   for (const tab of ['operate', 'contracts', 'tech', 'workshop']) {
     await page.click(`[data-tab="${tab}"]`);
