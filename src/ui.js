@@ -5,13 +5,13 @@
  */
 
 import { money, num, duration, escapeHtml, dayStamp, dateStamp } from './format.js';
-import { RATED_KW, rpmToHz, densityRatio, baseSpec } from './sim.js';
+import { RATED_KW, rpmToHz, densityRatio, baseSpec, AFR_SMOKE_LIMIT, NOMINAL_V, speedSetpoint, SYNC_LIMITS } from './sim.js';
 import { TECH, BRANCHES, TECH_BY_ID, canResearch, lockedBy, buildSpec } from './tech.js';
 import {
   demandAt, peakDemand, meanDemand, profileLabel, capLabel,
   missingCaps, estimateValue, TIER_REP,
 } from './contracts.js';
-import { SPEEDS, SERVICE, TANK_UPGRADE, fuelPrice, board, specFor } from './state.js';
+import { SPEEDS, SERVICE, TANK_UPGRADE, fuelPrice, board, specFor, syncState, envFor } from './state.js';
 
 // ------------------------------------------------------------------ topbar
 
@@ -209,6 +209,14 @@ function meterSpecs(g) {
           state: '',
         },
     {
+      key: 'afr', label: 'Air / Fuel', unit: 'RATIO : 1',
+      min: 10, max: 90, majors: 4, value: clamp01((m.afr - 10) / 80) * 80 + 10,
+      display: `${m.afr >= 89 ? '90+' : num(m.afr, 1)}:1`,
+      sub: m.afr < AFR_SMOKE_LIMIT ? 'RICH — sooting' : m.afr < 22 ? 'near smoke limit' : 'lean',
+      bands: [{ from: 0, to: (AFR_SMOKE_LIMIT - 10) / 80, color: RED }],
+      state: m.afr < AFR_SMOKE_LIMIT ? 'alarm' : m.afr < 20 ? 'warn' : '',
+    },
+    {
       key: 'smoke', label: 'Opacity', unit: 'PER CENT',
       min: 0, max: 100, majors: 4, value: m.smoke * 100,
       display: `${num(m.smoke * 100, 0)}%`,
@@ -234,6 +242,18 @@ function meterSpecs(g) {
           state: m.wear > 80 ? 'alarm' : m.wear > 50 ? 'warn' : '',
         },
   ];
+  if (job && !job.done && job.contract.bus) {
+    const q = m.kvar ?? 0;
+    const pfMin = job.contract.pfMin ?? 0.85;
+    out.push({
+      key: 'kvar', label: 'Reactive', unit: 'KILOVAR',
+      min: -60, max: 60, majors: 4, value: q,
+      display: `${num(q, 0)} kVAr`,
+      sub: `pf ${num(m.pf ?? 1, 3)}${(m.pf ?? 1) < pfMin ? ' — LOW' : ''}`,
+      bands: [{ from: 0, to: 0.16, color: RED }, { from: 0.84, to: 1, color: RED }],
+      state: m.synced && (m.pf ?? 1) < pfMin ? 'alarm' : '',
+    });
+  }
   for (const s of out) s.frac = clamp01((s.value - s.min) / (s.max - s.min));
   return out;
 }
@@ -270,7 +290,7 @@ function lampSpecs(g) {
     { key: 'load', label: 'On Load', on: m.breakerClosed, color: 'green' },
     { key: 'crank', label: 'Cranking', on: m.cranking > 0, color: 'amber' },
     { key: 'temp', label: 'Over Temp', on: m.coolantC > 105, color: 'red' },
-    { key: 'over', label: 'Overload', on: m.shedKW > 0.5, color: 'red' },
+    { key: 'over', label: 'Load Shed', on: m.shedKW > 0.5, color: 'red' },
     { key: 'lowfuel', label: 'Low Fuel', on: fuelPct < 20, color: 'amber' },
     { key: 'svc', label: 'Service', on: m.hoursSinceService > 250, color: 'amber' },
   ];
@@ -296,7 +316,83 @@ export function operateSignature(g) {
     !!g.job?.contract.thermalPayPerKWh,
     spec.altRatingKW,      // redraws the kW scale
     spec.tankL,            // redraws the fuel scale
+    spec.isochAvailable,   // adds a governor position
+    spec.avrFitted,        // adds an excitation position
+    !!g.job?.contract.bus, // brings out the synchroscope and the kVAr meter
   ].join('|');
+}
+
+
+/**
+ * The synchroscope. The needle sits at the phase difference between your
+ * machine and the bus, so it rotates once per beat of slip: clockwise when you
+ * are running fast, anticlockwise when slow. You close at the mark, with the
+ * needle creeping slowly clockwise -- that way the machine picks up load as it
+ * comes into step instead of being motored by the bus.
+ */
+function synchroscopeSvg() {
+  const R = 62, CX = 76, CY = 76;
+  const ticks = [];
+  for (let d = 0; d < 360; d += 10) {
+    const major = d % 30 === 0;
+    const a = (d * Math.PI) / 180;
+    const r0 = R, r1 = R - (major ? 9 : 5);
+    ticks.push(`<line x1="${(CX + r0 * Math.sin(a)).toFixed(1)}" y1="${(CY - r0 * Math.cos(a)).toFixed(1)}"
+      x2="${(CX + r1 * Math.sin(a)).toFixed(1)}" y2="${(CY - r1 * Math.cos(a)).toFixed(1)}"
+      stroke="#2a241c" stroke-width="${major ? 1.4 : 0.7}"/>`);
+  }
+  // The window in which the check-sync relay will let you close.
+  const w = SYNC_LIMITS.angleMax;
+  const aw = (w * Math.PI) / 180;
+  const arc = `M${(CX + (R + 4) * Math.sin(-aw)).toFixed(1)},${(CY - (R + 4) * Math.cos(-aw)).toFixed(1)}
+    A${R + 4},${R + 4} 0 0 1 ${(CX + (R + 4) * Math.sin(aw)).toFixed(1)},${(CY - (R + 4) * Math.cos(aw)).toFixed(1)}`;
+  return `<svg viewBox="0 0 152 152" class="scope-svg" role="img" aria-label="Synchroscope">
+    <defs>
+      <radialGradient id="scopeglass" cx="0.32" cy="0.14" r="0.9">
+        <stop offset="0" stop-color="#fff" stop-opacity="0.36"/>
+        <stop offset="0.5" stop-color="#fff" stop-opacity="0.04"/>
+        <stop offset="1" stop-color="#000" stop-opacity="0.16"/>
+      </radialGradient>
+    </defs>
+    <circle cx="${CX}" cy="${CY}" r="${R + 12}" fill="#201b16" stroke="#6d6960"/>
+    <circle cx="${CX}" cy="${CY}" r="${R + 6}" fill="#f4eeda" stroke="#8d8878"/>
+    <path d="${arc}" fill="none" stroke="#4a7a3a" stroke-width="5"/>
+    ${ticks.join('')}
+    <text x="${CX}" y="26" text-anchor="middle" font-family="Jost, sans-serif" font-size="9"
+      letter-spacing="1.2" fill="#2f6b28">SYNC</text>
+    <text x="20" y="80" text-anchor="middle" font-family="Jost, sans-serif" font-size="8.5"
+      letter-spacing="1" fill="#6b6252">SLOW</text>
+    <text x="132" y="80" text-anchor="middle" font-family="Jost, sans-serif" font-size="8.5"
+      letter-spacing="1" fill="#6b6252">FAST</text>
+    <g data-scope-needle transform="rotate(0 ${CX} ${CY})">
+      <line x1="${CX}" y1="${CY}" x2="${CX}" y2="${CY - R + 4}" stroke="#8e2a1c" stroke-width="2.4" stroke-linecap="round"/>
+      <line x1="${CX}" y1="${CY}" x2="${CX}" y2="${CY + 16}" stroke="#2b241c" stroke-width="3" stroke-linecap="round"/>
+    </g>
+    <circle cx="${CX}" cy="${CY}" r="5.5" fill="#2b241c"/>
+    <circle cx="${CX}" cy="${CY}" r="${R + 6}" fill="url(#scopeglass)"/>
+  </svg>`;
+}
+
+function renderSyncPanel(g) {
+  return `<div class="card">
+    <div class="card-head"><span class="card-title">Synchroscope</span>
+      <span class="faint mono" style="font-size:9.5px" data-sync="slip"></span></div>
+    <div class="card-body">
+      <div class="scope-wrap">
+        ${synchroscopeSvg()}
+        <div class="scope-side">
+          <div class="scope-row"><span class="scope-k">Incoming</span><span class="scope-v" data-sync="mhz"></span></div>
+          <div class="scope-row"><span class="scope-k">Bus</span><span class="scope-v" data-sync="bhz"></span></div>
+          <div class="scope-row"><span class="scope-k">Volts</span><span class="scope-v" data-sync="mv"></span></div>
+          <div class="scope-row"><span class="scope-k">Bus volts</span><span class="scope-v" data-sync="bv"></span></div>
+          <div class="lamp" data-lamp="sync" style="width:auto;flex-direction:row;gap:7px;margin-top:8px">
+            <span class="lamp-dot"></span><span class="lamp-label" data-f="label">Sync</span>
+          </div>
+        </div>
+      </div>
+      <div class="sync-msg" data-sync="msg"></div>
+    </div>
+  </div>`;
 }
 
 export function renderOperate(g) {
@@ -327,11 +423,57 @@ export function renderOperate(g) {
           <div class="speed-group" data-speeds>${speedBtns}</div>
         </div>
         <div class="card-body stack">
-          <div class="controls">
-            <button class="btn" data-act="start">Start</button>
-            <button class="btn" data-act="stop">Stop</button>
-            <button class="btn" data-act="breaker">Close Breaker</button>
-            <button class="btn" data-act="refuel">Refuel</button>
+          <div class="desk">
+
+            <div class="ctl-group">
+              <div class="ctl-legend">Engine</div>
+              <div class="ctl-row">
+                <button class="btn btn-sm" data-act="start">Start</button>
+                <button class="btn btn-sm" data-act="stop">Stop</button>
+              </div>
+              <div class="ctl-row"><button class="btn btn-sm" data-act="refuel">Refuel</button></div>
+              <div class="ctl-read" data-f="engineRead">—</div>
+            </div>
+
+            <div class="ctl-group">
+              <div class="ctl-legend">Governor</div>
+              <div class="mode-switch" data-modes="gov">
+                <button data-gov="manual">Man</button>
+                <button data-gov="droop">Droop</button>
+                <button data-gov="isoch" ${g.spec.isochAvailable ? '' : 'disabled'}>Isoch</button>
+              </div>
+              <div class="lever-row">
+                <button class="nudge" data-nudge="throttle" data-step="-0.004">▼</button>
+                <input class="lever" type="range" min="0" max="1" step="0.001" data-lever="throttle"
+                  value="${g.machine.throttle}" aria-label="Throttle" />
+                <button class="nudge" data-nudge="throttle" data-step="0.004">▲</button>
+              </div>
+              <div class="ctl-read" data-f="govRead">—</div>
+            </div>
+
+            <div class="ctl-group">
+              <div class="ctl-legend">Excitation</div>
+              <div class="mode-switch" data-modes="exc">
+                <button data-exc="manual">Hand</button>
+                <button data-exc="avr" ${g.spec.avrFitted ? '' : 'disabled'}>AVR</button>
+              </div>
+              <div class="lever-row">
+                <button class="nudge" data-nudge="exc" data-step="-0.01">▼</button>
+                <input class="lever" type="range" min="0" max="${g.spec.excMax}" step="0.005" data-lever="exc"
+                  value="${g.machine.excCmd}" aria-label="Field rheostat" />
+                <button class="nudge" data-nudge="exc" data-step="0.01">▲</button>
+              </div>
+              <div class="ctl-read" data-f="excRead">—</div>
+            </div>
+
+            <div class="ctl-group">
+              <div class="ctl-legend">Breakers</div>
+              <div class="ctl-row"><button class="btn btn-sm" data-act="field">Field</button></div>
+              <div class="ctl-row"><button class="btn btn-sm" data-act="breaker">Main</button></div>
+              <div class="ctl-row" data-f="forcerow"><button class="btn btn-sm btn-danger" data-act="force-close">Force</button></div>
+              <div class="ctl-read" data-f="brkRead">—</div>
+            </div>
+
           </div>
           <div class="lamp-row">${lamps}</div>
         </div>
@@ -352,6 +494,7 @@ export function renderOperate(g) {
     </div>
 
     <div class="stack">
+      ${g.job && !g.job.done && g.job.contract.bus ? renderSyncPanel(g) : ''}
       ${renderJobCard(g)}
       <div class="card">
         <div class="card-head"><span class="card-title">Day Log</span></div>
@@ -413,6 +556,100 @@ export function updateOperate(g, root, dt = 1 / 60) {
 
   for (const b of root.querySelectorAll('[data-speeds] .speed-btn')) {
     b.classList.toggle('is-active', Number(b.dataset.speed) === g.speed);
+  }
+
+  // ---- control desk ----------------------------------------------------
+  const spec = g.spec;
+  const env = envFor(g);
+  const bus = env.bus;
+  const setText = (sel, text) => {
+    const n = root.querySelector(sel);
+    if (n && n.textContent !== text) n.textContent = text;
+  };
+
+  for (const b of root.querySelectorAll('[data-modes="gov"] button')) {
+    b.classList.toggle('is-on', b.dataset.gov === m.govMode);
+  }
+  for (const b of root.querySelectorAll('[data-modes="exc"] button')) {
+    b.classList.toggle('is-on', b.dataset.exc === m.excMode);
+  }
+
+  // Levers are the operator's hand: only write back when they are not holding
+  // it, otherwise the value fights the drag.
+  const lever = (sel, value) => {
+    const el = root.querySelector(sel);
+    if (!el || el.dataset.dragging === '1') return;
+    const v = String(value);
+    if (el.value !== v && document.activeElement !== el) el.value = v;
+  };
+  lever('[data-lever="throttle"]', m.throttle.toFixed(3));
+  lever('[data-lever="exc"]', m.excCmd.toFixed(3));
+
+  setText('[data-f="engineRead"]',
+    m.running ? `${num(m.rpm, 0)} rpm` : m.cranking > 0 ? 'cranking' : 'stopped');
+
+  const rackPct = `${num(m.fuelCmd * 100, 0)}% rack`;
+  setText('[data-f="govRead"]',
+    m.govMode === 'manual'
+      ? `${num(m.throttle * 100, 1)}% lever · ${rackPct}`
+      : `set ${num(speedSetpoint(m.throttle), 0)} rpm · ${rackPct}`);
+
+  setText('[data-f="excRead"]',
+    !m.fieldClosed
+      ? 'field open'
+      : m.excMode === 'avr'
+        ? `AVR · ${num(m.exc, 2)} pu`
+        : `${num(m.excCmd, 2)} pu set · ${num(m.exc, 2)} actual`);
+
+  const sync = syncState(g);
+  setText('[data-f="brkRead"]',
+    m.breakerClosed
+      ? (m.synced ? `on bus · ${num(m.delta, 0)}°` : 'closed on load')
+      : sync.ok ? 'ready to close' : (sync.reason ?? 'not ready'));
+
+  setBtn('[data-act="field"]', {
+    disabled: !m.running && m.cranking <= 0,
+    text: m.fieldClosed ? 'Field Off' : 'Field On',
+    cls: `btn btn-sm ${m.fieldClosed ? 'btn-danger' : ''}`,
+  });
+  setBtn('[data-act="breaker"]', {
+    disabled: (!m.running && m.cranking <= 0) || (!m.breakerClosed && !sync.ok && !!bus),
+    text: m.breakerClosed ? 'Open' : 'Close',
+    cls: `btn btn-sm ${m.breakerClosed ? 'btn-danger' : sync.ok ? 'btn-primary' : ''}`,
+  });
+  // Forcing a close is only possible without a check-sync relay to stop you.
+  const forceRow = root.querySelector('[data-f="forcerow"]');
+  if (forceRow) {
+    const show = !!bus && !m.breakerClosed && !sync.ok && !spec.checkSync && m.running;
+    forceRow.style.display = show ? '' : 'none';
+  }
+
+  // ---- synchroscope ----------------------------------------------------
+  if (bus) {
+    const needle = root.querySelector('[data-scope-needle]');
+    if (needle) {
+      // No damping here: a synchroscope needle follows the phase difference
+      // exactly, and it must be able to spin right round.
+      needle.setAttribute('transform', `rotate(${(m.syncAngle ?? 0).toFixed(1)} 76 76)`);
+    }
+    const slip = m.slipHz ?? 0;
+    setText('[data-sync="slip"]',
+      `${slip >= 0 ? '+' : ''}${slip.toFixed(2)} Hz${Math.abs(slip) > 0.004 ? ` · ${(1 / Math.abs(slip)).toFixed(0)}s/rev` : ' · stopped'}`);
+    setText('[data-sync="mhz"]', `${num(m.synced ? bus.hz : rpmToHz(m.rpm), 2)} Hz`);
+    setText('[data-sync="bhz"]', `${num(bus.hz, 2)} Hz`);
+    setText('[data-sync="mv"]', `${num(m.volts, 0)} V`);
+    setText('[data-sync="bv"]', `${num(bus.volts, 0)} V`);
+    setText('[data-sync="msg"]',
+      m.synced ? `Tied to the bus at ${num(m.delta, 0)}° load angle.` : (sync.ok ? 'Matched — close now.' : sync.reason));
+    const lampEl = root.querySelector('[data-lamp="sync"]');
+    if (lampEl) {
+      const on = m.synced || sync.ok;
+      const cls = `lamp ${on ? 'on green' : ''}`;
+      if (lampEl.className !== cls) lampEl.className = cls;
+      const lbl = lampEl.querySelector('[data-f="label"]');
+      const txt = m.synced ? 'On Bus' : sync.ok ? 'Sync' : 'Not Matched';
+      if (lbl && lbl.textContent !== txt) lbl.textContent = txt;
+    }
   }
 
   const job = g.job;

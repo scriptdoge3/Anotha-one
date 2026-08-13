@@ -61,17 +61,31 @@ await page.click('[data-accept="t1-barn"]');
 await page.waitForTimeout(300);
 console.log('tab after accept:', await page.locator('.tab.is-active').textContent());
 
+// Full manual start: crank, close the field breaker, bring the volts up on the
+// rheostat, then close the main breaker.
 await page.click('[data-act="start"]');
-await page.waitForTimeout(400);
-// Ask for load while still cranking: the controller should arm and close later.
+await page.waitForTimeout(1200);
+await page.click('[data-act="field"]');
+await page.waitForTimeout(900);
 await page.click('[data-act="breaker"]');
-await page.waitForTimeout(2500);
+await page.waitForTimeout(1200);
+// Trim the field until the voltmeter reads nominal, as an operator would.
+for (let i = 0; i < 40; i++) {
+  const v = await page.evaluate(() => window.game().machine.volts);
+  if (Math.abs(v - 480) < 8) break;
+  await page.evaluate((dv) => {
+    const g = window.game();
+    g.machine.excCmd = Math.max(0, Math.min(g.spec.excMax, g.machine.excCmd + dv));
+  }, ((480 - v) / 480) * 0.5);
+  await page.waitForTimeout(110);
+}
 await shot('06-running');
 
 const readout = async () => page.evaluate(() => {
   const g = window.game();
   return {
-    running: g.machine.running, breaker: g.machine.breakerClosed,
+    running: g.machine.running, field: g.machine.fieldClosed, breaker: g.machine.breakerClosed,
+    volts: Math.round(g.machine.volts),
     hz: +(g.machine.hz ?? 0).toFixed(2), kw: +(g.machine.deliveredKW ?? 0).toFixed(1),
     coolant: +g.machine.coolantC.toFixed(1), elapsed: +(g.job?.progress.elapsedH ?? 0).toFixed(2),
     money: Math.round(g.money),

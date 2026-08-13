@@ -2,18 +2,28 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   baseSpec, newMachine, defaultEnv, step, runFor, rpmToHz, hzToRpm,
-  densityRatio, thermalDerate, RATED_KW,
+  densityRatio, thermalDerate, closeBreaker, RATED_KW,
 } from '../src/sim.js';
 import { buildSpec } from '../src/tech.js';
 
-/** Start a machine and settle it at a given load. */
-function running(owned = [], envOverrides = {}, load = 0, settleS = 900) {
+/**
+ * Bring a machine on line the way an operator actually would: crank it, close
+ * the field breaker, wind on some excitation, then close the main breaker.
+ * There is no shortcut -- without a field there are no volts to close onto.
+ */
+function running(owned = [], envOverrides = {}, load = 0, settleS = 900, opts = {}) {
   const spec = buildSpec(owned, baseSpec);
   const m = newMachine(spec);
   const env = { ...defaultEnv(), ...envOverrides };
   m.cranking = 6;
-  runFor(m, spec, env, 10);
-  m.breakerClosed = true;
+  runFor(m, spec, env, 12);
+  if (opts.gov) m.govMode = opts.gov;
+  if (opts.throttle !== undefined) m.throttle = opts.throttle;
+  m.fieldClosed = true;
+  m.excCmd = opts.exc ?? 1.25;
+  m.excMode = opts.excMode ?? 'manual';
+  runFor(m, spec, env, 4);
+  closeBreaker(m, spec, env);
   env.demandKW = load;
   runFor(m, spec, env, settleS);
   return { m, spec, env };
@@ -60,7 +70,7 @@ test('mechanical droop lets speed fall as load is added', () => {
 
 test('an isochronous governor holds 60.0 Hz at any load', () => {
   for (const load of [10, 45, 75]) {
-    const { m } = running(['avr', 'govlinkage', 'isoch'], {}, load, 900);
+    const { m } = running(['avr', 'govlinkage', 'isoch'], {}, load, 900, { gov: 'isoch' });
     assert.ok(
       Math.abs(rpmToHz(m.rpm) - 60) < 0.1,
       `load ${load} kW settled at ${rpmToHz(m.rpm).toFixed(2)} Hz`,
@@ -81,8 +91,11 @@ test('sustained gross overload trips the breaker on under-frequency', () => {
   const m = newMachine(spec);
   const env = defaultEnv();
   m.cranking = 6;
-  runFor(m, spec, env, 10);
-  m.breakerClosed = true;
+  runFor(m, spec, env, 12);
+  m.fieldClosed = true;
+  m.excCmd = 1.25;
+  runFor(m, spec, env, 4);
+  closeBreaker(m, spec, env);
   env.demandKW = 400;
   const events = runFor(m, spec, env, 30);
   assert.ok(events.some((e) => e.type === 'trip'), 'expected an under-frequency trip');
@@ -150,8 +163,11 @@ test('running out of fuel stops the engine and opens the breaker', () => {
   const m = newMachine(spec);
   const env = { ...defaultEnv(), demandKW: 60 };
   m.cranking = 6;
-  runFor(m, spec, env, 10);
-  m.breakerClosed = true;
+  runFor(m, spec, env, 12);
+  m.fieldClosed = true;
+  m.excCmd = 1.25;
+  runFor(m, spec, env, 4);
+  closeBreaker(m, spec, env);
   m.fuelL = 0.05;
   const events = runFor(m, spec, env, 60);
   assert.ok(events.some((e) => e.type === 'out-of-fuel'));

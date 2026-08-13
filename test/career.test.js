@@ -8,7 +8,7 @@ import {
 } from '../src/contracts.js';
 import {
   createGame, acceptContract, advance, startEngine, setBreaker, refuel,
-  buyTech, doService, board,
+  buyTech, doService, board, setFieldBreaker, setExcitation,
 } from '../src/state.js';
 
 // ------------------------------------------------------------------ tech --
@@ -250,22 +250,67 @@ test('a competently run tier-1 job turns a profit end to end', () => {
   const g = createGame();
   const startMoney = g.money;
   assert.ok(acceptContract(g, 't1-barn').ok);
+
+  // A competent operator: crank, close the field breaker, bring the volts up,
+  // close the main breaker, then keep trimming the field as load changes --
+  // there is no AVR fitted on a stock set.
+  const trimField = () => {
+    const err = (480 - g.machine.volts) / 480;
+    if (Math.abs(err) > 0.008) setExcitation(g, g.machine.excCmd + err * 0.6);
+  };
+
   startEngine(g);
   advance(g, 12);
+  setFieldBreaker(g, true);
+  for (let i = 0; i < 12; i++) { advance(g, 1); trimField(); }
   setBreaker(g, true);
 
   let guard = 0;
-  while (g.job && !g.job.done && guard++ < 4000) {
+  let worstVolts = 0;
+  while (g.job && !g.job.done && guard++ < 6000) {
     if (g.machine.fuelL / g.spec.tankL < 0.2) refuel(g);
-    if (!g.machine.running) { startEngine(g); advance(g, 10); setBreaker(g, true); }
-    advance(g, 30);
+    if (!g.machine.running) { startEngine(g); advance(g, 12); setFieldBreaker(g, true); advance(g, 4); }
+    if (g.machine.running && !g.machine.breakerClosed) setBreaker(g, true);
+    trimField();
+    advance(g, 20);
+    // Ignore the step at breaker close; what matters is the sustained trim.
+    if (g.machine.breakerClosed && g.job && !g.job.done && g.job.progress.elapsedH > 0.05) {
+      worstVolts = Math.max(worstVolts, Math.abs(g.machine.volts - 480) / 480);
+    }
   }
   assert.ok(g.job?.done, 'job should have completed');
   const r = g.job.result;
   assert.ok(!r.failed, 'a well-run barn job should not fail');
+  assert.ok(
+    worstVolts < 0.06,
+    `hand-trimmed voltage drifted ${(worstVolts * 100).toFixed(1)}% off nominal`,
+  );
+  assert.ok(
+    g.job.progress.voltViolSec < 180,
+    `spent ${(g.job.progress.voltViolSec / 60).toFixed(1)} min outside the voltage clause`,
+  );
   assert.ok(g.money > startMoney, `money went ${startMoney} -> ${g.money}`);
   assert.ok(g.reputation > 0);
   assert.ok(g.machine.hours > 7, 'should have logged engine hours');
+});
+
+test('leaving the field untrimmed costs you the power quality clause', () => {
+  // The same job, run by someone who set the rheostat once and walked away.
+  const g = createGame();
+  assert.ok(acceptContract(g, 't1-barn').ok);
+  startEngine(g);
+  advance(g, 12);
+  setFieldBreaker(g, true);
+  setExcitation(g, 1.35);
+  advance(g, 4);
+  setBreaker(g, true);
+  let guard = 0;
+  while (g.job && !g.job.done && guard++ < 6000) advance(g, 20);
+  assert.ok(g.job?.done);
+  assert.ok(
+    g.job.progress.voltViolSec > 600,
+    'an untrimmed field should sit outside the voltage clause',
+  );
 });
 
 test('servicing costs money and removes wear', () => {

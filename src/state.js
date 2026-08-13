@@ -10,6 +10,11 @@ import {
   newMachine,
   defaultEnv,
   step,
+  closeBreaker as simCloseBreaker,
+  forceCloseBreaker,
+  syncCheck,
+  speedSetpoint,
+  clamp,
   RATED_KW,
 } from './sim.js';
 import { buildSpec, TECH_BY_ID, canResearch } from './tech.js';
@@ -319,33 +324,152 @@ export function stopEngine(g) {
   const m = g.machine;
   m.running = false;
   m.breakerClosed = false;
+  m.synced = false;
   m.cranking = 0;
   m.govInteg = 0;
+  m.avrInteg = 0;
   m.pendingClose = false;
   return { ok: true };
 }
 
-export function setBreaker(g, closed) {
+/** Environment for the job in progress (or the yard, when idle). */
+export function envFor(g) {
+  const env = defaultEnv();
+  const c = g.job && !g.job.done ? g.job.contract : null;
+  if (c) {
+    env.ambientC = c.ambientC ?? 20;
+    env.altitudeM = c.altitudeM ?? 0;
+    env.abrasion = c.abrasion ?? 1;
+    env.bus = c.bus ?? null;
+  }
+  return env;
+}
+
+// ---- operator controls ----------------------------------------------------
+
+export function setThrottle(g, v) {
+  g.machine.throttle = clamp(v, 0, 1);
+  return { ok: true };
+}
+
+/** Nudge the throttle, the way a raise/lower switch works. */
+export function bumpThrottle(g, delta) {
+  return setThrottle(g, g.machine.throttle + delta);
+}
+
+export function setGovMode(g, mode) {
+  if (mode === 'isoch' && !g.spec.isochAvailable) {
+    return { ok: false, msg: 'No electronic governor fitted.' };
+  }
   const m = g.machine;
-  if (closed) {
-    if (!m.running && m.cranking <= 0) {
-      return { ok: false, msg: 'Start the engine first.' };
+  if (m.govMode === mode) return { ok: true };
+
+  // Bumpless transfer. Whatever mode you select, it takes over holding the
+  // rack exactly where it already is -- otherwise selecting droop while
+  // carrying load throws the rack shut and, on a bus, slips a pole.
+  const rack = clamp(m.fuelCmd, 0, 1);
+  const droop = g.spec.droop;
+  if (m.running) {
+    if (mode === 'manual') {
+      m.throttle = rack;
+    } else if (mode === 'droop') {
+      const setRpm = (rack * droop * 1800 + m.rpm) / (1 + droop);
+      m.throttle = clamp((setRpm - 1500) / 400, 0, 1);
+    } else if (mode === 'isoch') {
+      m.throttle = clamp((m.rpm - 1500) / 400, 0, 1);
+      m.govInteg = rack;
     }
-    if (m.hz >= 58 && m.hz <= 62 && m.running) {
-      m.breakerClosed = true;
-      m.pendingClose = false;
-      m.recloseTimer = 0;
-    } else {
-      // Arm it: the set will pick the load up the moment it is up to speed.
-      m.pendingClose = true;
-      return { ok: true, msg: 'Breaker armed — will close once the set is up to speed.' };
-    }
-  } else {
+  }
+  m.govMode = mode;
+  if (mode !== 'isoch') m.govInteg = 0;
+  return { ok: true };
+}
+
+export function setExcitation(g, v) {
+  g.machine.excCmd = clamp(v, 0, g.spec.excMax);
+  return { ok: true };
+}
+
+export function bumpExcitation(g, delta) {
+  return setExcitation(g, g.machine.excCmd + delta);
+}
+
+export function setExcMode(g, mode) {
+  if (mode === 'avr' && !g.spec.avrFitted) {
+    return { ok: false, msg: 'No automatic voltage regulator fitted.' };
+  }
+  const m = g.machine;
+  if (mode === 'manual' && m.excMode === 'avr') {
+    // Take over at whatever the AVR had wound the field to.
+    m.excCmd = clamp(m.exc, 0, g.spec.excMax);
+  }
+  m.excMode = mode;
+  m.avrInteg = 0;
+  return { ok: true };
+}
+
+export function setFieldBreaker(g, closed) {
+  const m = g.machine;
+  if (!closed && m.breakerClosed) {
+    return { ok: false, msg: 'Open the main breaker before killing the field.' };
+  }
+  m.fieldClosed = closed;
+  if (!closed) m.avrInteg = 0;
+  logLine(g, closed ? 'Field breaker closed — excitation live.' : 'Field breaker opened.', 'info');
+  return { ok: true };
+}
+
+/**
+ * Main breaker. On a dead bus this is a health check; onto a live bus it is a
+ * synchronising operation and the synchroscope has to be right.
+ */
+export function setBreaker(g, closed, { force = false } = {}) {
+  const m = g.machine;
+  const env = envFor(g);
+
+  if (!closed) {
     m.breakerClosed = false;
+    m.synced = false;
     m.pendingClose = false;
     m.recloseTimer = 0;
+    return { ok: true };
   }
-  return { ok: true };
+
+  if (!m.running && m.cranking <= 0) {
+    return { ok: false, msg: 'Start the engine first.' };
+  }
+
+  const res = force
+    ? forceCloseBreaker(m, g.spec, env)
+    : simCloseBreaker(m, g.spec, env);
+
+  if (res.shock) {
+    logLine(
+      g,
+      `Closed out of step. The whole driveline felt it — ${res.wear.toFixed(0)}% wear in one bang.`,
+      'bad',
+    );
+    return { ok: true, msg: 'Out-of-phase close!' };
+  }
+  if (res.ok) {
+    if (env.bus) logLine(g, 'Synchronised and on the bus.', 'good');
+    return { ok: true };
+  }
+  // Off a live bus, an unready machine just arms the breaker until it is ready.
+  if (!env.bus && !res.blocked) {
+    m.pendingClose = true;
+    return { ok: true, msg: 'Breaker armed — will close once the set is up to speed.' };
+  }
+  return { ok: false, msg: res.msg };
+}
+
+/** What the synchroscope and the close button need to know. */
+export function syncState(g) {
+  return syncCheck(g.machine, envFor(g));
+}
+
+export function targetSpeed(g) {
+  return speedSetpoint(g.machine.throttle);
 }
 
 // ----------------------------------------------------------- main tick ----
@@ -356,6 +480,8 @@ const EVENT_TEXT = {
   'out-of-fuel': ['Ran the tank dry. Engine stopped.', 'bad'],
   'no-fuel-start': ['Cranked on an empty tank.', 'bad'],
   overheat: ['Coolant over 118 °C — the set is derating hard.', 'bad'],
+  overspeed: ['OVERSPEED TRIP — fuel cut. Watch the rack when you drop load.', 'bad'],
+  'pole-slip': ['Pole slip — lost synchronism with the bus and thrown off line.', 'bad'],
   seized: ['Catastrophic failure. The engine has seized.', 'bad'],
   trip: ['Breaker tripped on under-frequency.', 'bad'],
   reclose: ['Breaker reclosed automatically.', 'info'],
@@ -377,12 +503,7 @@ export function advance(g, simSeconds) {
   const job = g.job;
   const contract = job?.contract;
 
-  const env = defaultEnv();
-  if (contract) {
-    env.ambientC = contract.ambientC ?? 20;
-    env.altitudeM = contract.altitudeM ?? 0;
-    env.abrasion = contract.abrasion ?? 1;
-  }
+  const env = envFor(g);
 
   const maxSubsteps = 4200;
   const dt = Math.min(0.02, Math.max(0.005, simSeconds / maxSubsteps));

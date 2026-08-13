@@ -363,6 +363,27 @@ export const CONTRACTS = [
     repGain: 21,
   },
 
+  {
+    id: 't3-gridexport',
+    tier: 3,
+    title: 'Grid Export Trial',
+    client: 'Southern Board of Electricity',
+    brief:
+      'Your first job tied to the public supply. Match the bus on the synchroscope, close at the mark, then hold the agreed export on the throttle and the power factor on the field. Close it out of step and they will hear about it in the substation.',
+    hours: 14,
+    bus: { hz: 60, volts: 480 },
+    pfMin: 0.88,
+    profile: { type: 'ramp', points: [[0, 30], [2, 62], [11, 62], [14, 40]] },
+    payPerKWh: 1.18,
+    mobilization: 2800,
+    freqTolHz: 1.0,
+    voltTolPct: 6,
+    penaltyPerOutageMin: 70,
+    requires: ['parallel'],
+    repGain: 18,
+    ambientC: 16,
+  },
+
   // ---------------- TIER 4 : reputation 72 ------------------------------
   {
     id: 't4-hospital',
@@ -407,8 +428,10 @@ export const CONTRACTS = [
     title: 'Festival Main Stage',
     client: 'Ninebarrow Live',
     brief:
-      'Headline weekend. You are one machine on a synchronised bus, and the front of house desk is unforgiving about frequency.',
+      'Headline weekend, and you are one machine on a bus with three others. Synchronise onto it, then hold your share of the load on the throttle and your power factor on the field.',
     hours: 26,
+    bus: { hz: 60, volts: 480 },
+    pfMin: 0.9,
     profile: { type: 'diurnal', min: 38, max: 104 },
     payPerKWh: 1.5,
     mobilization: 6400,
@@ -447,6 +470,8 @@ export const CONTRACTS = [
     brief:
       'Seventy-two hours as the only generation for four hundred people, selling heat to the harbour buildings at the same time. The whole tree, working at once.',
     hours: 72,
+    bus: { hz: 60, volts: 480 },
+    pfMin: 0.92,
     profile: { type: 'diurnal', min: 52, max: 118 },
     payPerKWh: 1.62,
     thermalPayPerKWh: 0.4,
@@ -572,6 +597,8 @@ export function newProgress(contract) {
     outageSec: 0,
     freqViolSec: 0,
     voltViolSec: 0,
+    pfViolSec: 0,
+    outOfStep: 0,
     smokeSec: 0,
     fuelUsedL: 0,
     tripCount: 0,
@@ -588,7 +615,9 @@ export function accrue(prog, contract, m, demand, dt) {
   const h = dt / 3600;
   prog.elapsedH += h;
   prog.demandedKWh += demand * h;
-  prog.energyKWh += m.deliveredKW * h;
+  // You are paid against the contracted schedule, so pushing more onto a bus
+  // than you agreed to supply just burns your own fuel.
+  prog.energyKWh += Math.min(m.deliveredKW, demand) * h;
   prog.thermalKWh += (m.thermalKW ?? 0) * h;
   prog.fuelUsedL += (m.fuelLPerH ?? 0) * h;
   prog.peakCoolantC = Math.max(prog.peakCoolantC, m.coolantC);
@@ -605,6 +634,11 @@ export function accrue(prog, contract, m, demand, dt) {
     }
     const vErr = Math.abs((m.volts ?? 480) - 480) / 480 * 100;
     if (vErr > contract.voltTolPct) prog.voltViolSec += dt;
+    // Tied to a bus, volts and frequency are the bus's problem; what you are
+    // accountable for is the reactive power you are pushing into it.
+    if (contract.bus && contract.pfMin && m.synced && (m.pf ?? 1) < contract.pfMin) {
+      prog.pfViolSec += dt;
+    }
   }
   if ((m.smoke ?? 0) > 0.08) prog.smokeSec += dt;
 }
@@ -655,6 +689,14 @@ export function settle(prog, contract) {
     });
   }
 
+  const pfPenalty = -(prog.pfViolSec / 60) * 16;
+  if (pfPenalty < -0.5) {
+    lines.push({
+      label: `Power factor below limit (${(prog.pfViolSec / 60).toFixed(1)} min)`,
+      amount: pfPenalty,
+    });
+  }
+
   const smokePenalty = -(prog.smokeSec / 60) * 6;
   if (smokePenalty < -0.5) {
     lines.push({
@@ -690,7 +732,8 @@ export function settle(prog, contract) {
     completion >= 0.999 &&
     prog.outageSec < 30 &&
     prog.freqViolSec < 60 &&
-    prog.voltViolSec < 60;
+    prog.voltViolSec < 60 &&
+    prog.pfViolSec < 60;
   if (clean) {
     bonus = contract.mobilization * 0.35 + energyPay * 0.1;
     lines.push({ label: 'Clean-run bonus', amount: bonus });

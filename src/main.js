@@ -6,7 +6,8 @@
 import {
   createGame, advance, acceptContract, abandonJob, clearFinishedJob,
   startEngine, stopEngine, setBreaker, refuel, buyTech, doService, buyTank,
-  refreshBoard, SPEEDS,
+  refreshBoard, setThrottle, bumpThrottle, setGovMode, setExcitation,
+  bumpExcitation, setExcMode, setFieldBreaker, refreshSpec, SPEEDS,
 } from './state.js';
 import * as save from './save.js';
 import {
@@ -103,7 +104,7 @@ function switchTab(tab) {
 // ------------------------------------------------------------------- input
 
 document.addEventListener('click', (ev) => {
-  const t = ev.target.closest('[data-act],[data-speed],[data-accept],[data-tech],[data-buy],[data-service],[data-tab]');
+  const t = ev.target.closest('[data-act],[data-speed],[data-accept],[data-tech],[data-buy],[data-service],[data-tab],[data-gov],[data-exc]');
   if (!t) return;
 
   if (t.dataset.tab) return switchTab(t.dataset.tab);
@@ -133,8 +134,17 @@ document.addEventListener('click', (ev) => {
 
   if (t.dataset.service) return apply(doService(g, t.dataset.service));
 
+  if (t.dataset.gov) return apply(setGovMode(g, t.dataset.gov));
+  if (t.dataset.exc) return apply(setExcMode(g, t.dataset.exc));
+
   switch (t.dataset.act) {
     case 'start': return apply(startEngine(g));
+    case 'field': return apply(setFieldBreaker(g, !g.machine.fieldClosed));
+    case 'force-close':
+      if (confirm('Force the breaker shut out of step?\n\nThe rotor will be dragged into step with the bus. Expect real damage.')) {
+        apply(setBreaker(g, true, { force: true }));
+      }
+      return;
     case 'stop': return apply(stopEngine(g));
     case 'breaker': return apply(setBreaker(g, !g.machine.breakerClosed));
     case 'refuel': return apply(refuel(g));
@@ -154,6 +164,50 @@ document.addEventListener('click', (ev) => {
       return;
   }
 });
+
+// ---- levers and nudge switches --------------------------------------------
+// Levers write straight through on input, and are marked while held so the
+// per-frame patch does not fight the drag.
+document.addEventListener('input', (ev) => {
+  const el = ev.target;
+  if (!el.dataset || !el.dataset.lever) return;
+  const v = Number(el.value);
+  if (el.dataset.lever === 'throttle') setThrottle(g, v);
+  else if (el.dataset.lever === 'exc') setExcitation(g, v);
+});
+for (const [down, up] of [['pointerdown', 'pointerup'], ['pointerdown', 'pointercancel']]) {
+  document.addEventListener(down, (ev) => {
+    const el = ev.target.closest?.('[data-lever]');
+    if (el) el.dataset.dragging = '1';
+  });
+  document.addEventListener(up, () => {
+    for (const el of document.querySelectorAll('[data-lever]')) delete el.dataset.dragging;
+  });
+}
+
+// Raise/lower switches repeat while held, the way a real spring-return
+// speed-trim switch does.
+let nudgeTimer = null;
+function stopNudge() {
+  if (nudgeTimer) { clearInterval(nudgeTimer); nudgeTimer = null; }
+}
+document.addEventListener('pointerdown', (ev) => {
+  const t = ev.target.closest?.('[data-nudge]');
+  if (!t) return;
+  ev.preventDefault();
+  const step = Number(t.dataset.step);
+  const which = t.dataset.nudge;
+  const fire = () => {
+    if (which === 'throttle') bumpThrottle(g, step);
+    else bumpExcitation(g, step);
+  };
+  fire();
+  stopNudge();
+  nudgeTimer = setInterval(fire, 70);
+});
+for (const e of ['pointerup', 'pointercancel', 'pointerleave']) {
+  document.addEventListener(e, stopNudge);
+}
 
 el('btnSave').addEventListener('click', () => {
   const ok = save.save(g);
@@ -183,6 +237,15 @@ document.addEventListener('keydown', (ev) => {
   }
   const idx = '123456'.indexOf(ev.key);
   if (idx >= 0 && idx < SPEEDS.length) { g.speed = SPEEDS[idx]; markDirty(); }
+
+  // Arrows trim the throttle; shift trims the field instead.
+  const fine = ev.altKey ? 0.001 : 0.005;
+  if (ev.key === 'ArrowUp' || ev.key === 'ArrowDown') {
+    ev.preventDefault();
+    const d = (ev.key === 'ArrowUp' ? 1 : -1) * fine;
+    if (ev.shiftKey) bumpExcitation(g, d * 2);
+    else bumpThrottle(g, d);
+  }
 });
 
 // -------------------------------------------------------------- frame loop
@@ -225,5 +288,6 @@ document.addEventListener('visibilitychange', () => {
 switchTab('operate');
 requestAnimationFrame(frame);
 
-// Expose for debugging in the console.
+// Exposed for debugging in the console and for the browser-driven checks.
 window.game = () => g;
+window.__refresh = () => { refreshSpec(g); markDirty(); };

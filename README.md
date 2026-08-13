@@ -3,16 +3,21 @@
 A career sim about operating, abusing and slowly rebuilding one 75 kW diesel
 generator, presented as a 1963 generator control desk.
 
-You start in April 1963 with a tired set, £2,400 and no reputation. You take hire contracts,
-keep the frequency inside the clause you signed, burn fuel you paid for, and put
-the margin back into the machine. Thirty-two upgrades across five branches take
-it from a naturally aspirated mechanical-governor unit that struggles at
-altitude to a compound-turbocharged, isochronous, Stage V combined-heat-and-power
-machine delivering 132 kW.
+You start in April 1963 with a tired set, £2,400 and no reputation. You take hire
+contracts, run the machine by hand, burn fuel you paid for, and put the margin
+back into it. Thirty-two upgrades across five branches take it from a naturally
+aspirated, hand-excited unit with a flyweight governor to a compound-turbocharged,
+isochronous, Stage V combined-heat-and-power machine delivering 132 kW.
+
+Nothing starts itself. You crank the engine, close the field breaker, wind the
+excitation up until the voltmeter reads 480, close the main breaker onto the
+load — and then keep trimming the field as load comes and goes, because a
+synchronous machine with no AVR loses close to a third of its terminal volts
+between no load and full load. Automation is something you buy.
 
 ```bash
 npm start      # http://localhost:8080
-npm test       # 45 tests over the physics and the career layer
+npm test       # 68 tests over the physics, the operator controls and the career
 npm run apk    # build load-bank.apk  (needs ANDROID_SDK_ROOT)
 ```
 
@@ -37,13 +42,61 @@ period entirely.
 
 Everything is drawn with CSS gradients and inline SVG. There is not one raster
 asset in the interface, so it stays sharp at any density and the whole app fits
-in a 136 KB APK.
+in a 144 KB APK.
 
 Prices are in period sterling and the date runs from 1 April 1963, but the
 economy is balanced for play rather than to 1963 price levels — and the upper
 tech tree (SCR aftertreatment, lithium buffers, organic Rankine cycles) runs
 well past what 1963 could actually build. The desk is the period piece; the
 engineering is allowed to be ahead of it.
+
+## Operating it
+
+Two controls do everything, and what they do depends entirely on whether you are
+on your own or tied to a live bus.
+
+| | Off bus (island load) | On bus (paralleled) |
+| --- | --- | --- |
+| **Throttle** | engine speed → **frequency** | mechanical power → load angle → **real power (kW)** |
+| **Field** | excitation → **voltage** | internal EMF → **reactive power (kVAr)** |
+
+That reversal is the central fact of synchronous machine operation, and it falls
+out of the model rather than being special-cased. Tied to a bus, the frequency
+and voltage are the bus's to hold; what you are accountable for is how much real
+power you export and how much reactive power you push into it.
+
+**Governor selector.** `MANUAL` puts your hand directly on the fuel rack, and
+nothing at all holds the speed — drop the load with the rack open and the engine
+runs away into the overspeed trip. `DROOP` is the flyweight governor: speed falls
+as load rises, which is exactly what lets several sets share a bus. `ISOCH` holds
+the speed you set at any load, once you have bought an electronic governor. Mode
+changes are bumpless: the new mode takes over holding the rack where it already
+is.
+
+**Excitation selector.** `HAND` is the field rheostat. `AVR` is automatic, once
+fitted — and on a bus it regulates power factor rather than voltage, because
+voltage is no longer yours to set.
+
+**Air/fuel ratio.** The AFR meter reads the balance the smoke limiter is already
+enforcing. Full rack on a healthy naturally aspirated six lands at 17.5:1, which
+is the real diesel smoke limit; light load runs 90:1 and up. Go below the limit
+and you make soot instead of torque, which the contract's emissions clause
+notices.
+
+**Synchronising.** Paralleling contracts put a live bus behind the terminals and
+a synchroscope on the desk. The needle sits at the phase difference and rotates
+once per beat of slip: clockwise when you are fast, anticlockwise when slow. You
+match volts on the field, set the machine a touch fast on the throttle so the
+needle creeps clockwise, and close at the mark. Close it out of step and the
+rotor is dragged bodily into step with the bus — expect real damage and to be
+thrown straight back off line. Paralleling switchgear brings a check-sync relay
+that simply refuses the close; without one, there is nothing between you and the
+bang.
+
+Hold too much load on a bus and the load angle walks past 90°, the machine slips
+a pole and drops off line. That is also why an isochronous governor is the wrong
+choice when paralleled — it winds the rack wide open trying to raise a frequency
+the bus is holding down.
 
 ## The machine is actually simulated
 
@@ -75,6 +128,12 @@ being scripted:
 - **The alternator is a separate ceiling.** You can build an engine that makes far
   more shaft power than the windings will pass. Until you rewind it, that power
   is unsellable.
+- **Voltage regulation is genuinely bad by hand.** Terminal volts are the internal
+  EMF minus armature reaction, so they sag with load. The AVR upgrade is not a
+  stat bump; it is the end of a chore.
+- **Paralleled machines swing.** The rotor is held to the bus by synchronising
+  torque and damper windings, so a load change sets up a real ~1.5 Hz swing that
+  settles out, and too much load pulls it out of step entirely.
 
 Calibrated against real machines: ~22 L/h and 0.25 kg/kWh at full load, ~96 °C
 coolant, ~6 min thermal time constant, 2.3 L/h at idle.
@@ -88,7 +147,7 @@ Five branches, 32 nodes, one either/or fork.
 | **Air & Fuel** | Turbocharging, intercooling, common rail. Raw output and cleaner combustion. |
 | **Materials** | Durability, bottom-end strength, and the alternator rewind that lifts the electrical ceiling. |
 | **Thermal** | Cooling headroom, then waste-heat recovery and CHP — selling the heat you were throwing away. |
-| **Control** | AVR, isochronous governing, load anticipation, hybrid battery buffer, paralleling. |
+| **Control** | AVR, isochronous governing, paralleling switchgear, load anticipation, hybrid battery buffer. |
 | **Compliance** | Acoustic canopy, DPF, SCR, HVO. Unlocks urban, hospital and municipal work. |
 
 **Variable-Geometry Turbo** and **Compound Turbocharging** lock each other out
@@ -108,8 +167,9 @@ stock 78 kW → intake 80 → turbo 84 → intercooler 88 → radiator 92
 
 ## The career
 
-Twenty hand-written contracts across five reputation tiers, plus generated filler
-work. Each has a load profile (flat, ramping, square-wave, spiking, diurnal),
+Twenty-one hand-written contracts across five reputation tiers, plus generated
+filler work. Three of them put you on a live bus, where the clause is on power
+factor rather than voltage. Each has a load profile (flat, ramping, square-wave, spiking, diurnal),
 frequency and voltage clauses, site conditions, and liquidated damages.
 
 Contracts pay a mobilisation advance on acceptance — which is what guarantees you
@@ -125,13 +185,15 @@ to 900 running hours.
 
 ## Controls
 
-Space pauses; `1`–`6` set the time scale from 1× to 600×. The simulation is
+Arrow up/down trims the throttle, shift+arrows trims the field, alt for fine
+steps. The raise/lower switches beside each lever repeat while held. Space
+pauses; `1`–`6` set the time scale from 1× to 600×. The simulation is
 timestep-independent across that whole range — there is a test for it, because a
 governor loop that went unstable at 600× would quietly invent penalties.
 
 ## Android
 
-`npm run apk` produces a sideloadable `load-bank.apk` (~136 KB). It needs an
+`npm run apk` produces a sideloadable `load-bank.apk` (~144 KB). It needs an
 Android SDK with build-tools 34 and platform 34:
 
 ```bash
@@ -169,16 +231,21 @@ src/main.js        frame loop and event wiring
 fonts.css          embedded period typefaces (base64, OFL)
 android/           manifest, resources and the WebView Activity
 scripts/           APK build, browser smoke test, mobile layout check
-test/              45 tests
+test/              68 tests
 ```
 
-Beyond the unit tests there are two browser checks (both need `npm i` and a
+Beyond the unit tests there are three browser checks (all need `npm i` and a
 running `npm start`): `npm run smoke` plays a full job end to end and fails on
-any console error, and `npm run mobile` renders every tab at phone and tablet
-sizes and fails on horizontal overflow.
+any console error, `npm run mobile` renders every tab at phone and tablet sizes
+and fails on horizontal overflow, and `npm run operator` drives the control desk
+by hand — manual start, hand voltage trim, then synchronising onto a live bus and
+sweeping throttle against field to confirm they really do control kW and kVAr.
 
 The physics core is pure and deterministic, which is why the interesting
 properties are testable at all: that BSFC lands in the real range, that an
-isochronous governor holds 60.00 Hz at any load, that fast-forward doesn't change
-the answer, and that no legal combination of upgrades produces a degenerate
-machine.
+isochronous governor holds 60.00 Hz at any load, that smoke only ever appears
+below 17.5:1, that the synchroscope turns once per beat of slip, that an
+out-of-phase close does real damage while the check-sync relay prevents it, that
+throttle and field swap roles the moment you tie to a bus, that fast-forward
+doesn't change the answer, and that no legal combination of upgrades produces a
+degenerate machine.

@@ -8,7 +8,8 @@
     "test": "node --test test/*.test.js",
     "smoke": "node scripts/smoke.mjs",
     "mobile": "node scripts/mobile-check.mjs",
-    "apk": "bash scripts/build-apk.sh"
+    "apk": "bash scripts/build-apk.sh",
+    "operator": "node scripts/operator-check.mjs"
   },
   "license": "MIT",
   "private": true,

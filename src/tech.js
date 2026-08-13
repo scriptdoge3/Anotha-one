@@ -340,12 +340,13 @@ export const TECH = [
     id: 'avr',
     branch: 'control',
     row: 0,
-    name: 'Digital AVR',
+    name: 'Automatic Voltage Regulator',
     cost: 2200,
-    blurb: 'Microprocessor excitation control.',
-    detail: 'Holds terminal voltage almost flat against load. Without it, voltage sags with every kilowatt you add.',
+    blurb: 'Closed-loop excitation control.',
+    detail:
+      'Adds an AVR position to the excitation selector. Left on hand control, a synchronous machine loses close to a third of its terminal volts between no load and full load, and you have to wind the field up yourself to chase it. The AVR does that for you — and on a live bus it regulates power factor instead.',
     apply: (s) => {
-      s.voltSag = 0.008;
+      s.avrFitted = true;
     },
   },
   {
@@ -356,7 +357,7 @@ export const TECH = [
     name: 'Precision Governor Linkage',
     cost: 1800,
     blurb: 'Ball-jointed rack linkage, rebuilt flyweights.',
-    detail: 'Halves the droop of the mechanical governor. A stopgap, but a cheap one.',
+    detail: 'Halves the droop of the mechanical governor, so speed falls less between no load and full load. A stopgap, but a cheap one.',
     apply: (s) => {
       s.droop = 0.015;
     },
@@ -370,10 +371,9 @@ export const TECH = [
     cost: 8800,
     blurb: 'Closed-loop speed control with integral action.',
     detail:
-      'Holds exactly 60.0 Hz at any load instead of drooping across the range. Everything with a tight frequency clause needs this.',
+      'Adds an ISOCH position to the governor selector: it holds exactly the speed you set, at any load, instead of drooping across the range. Everything with a tight frequency clause needs this.',
     apply: (s) => {
-      s.isochronous = true;
-      s.droop = 0;
+      s.isochAvailable = true;
     },
   },
   {
@@ -409,15 +409,16 @@ export const TECH = [
   {
     id: 'parallel',
     branch: 'control',
-    row: 4,
-    requires: ['battery'],
+    row: 3,
+    requires: ['isoch'],
     name: 'Paralleling Switchgear',
-    cost: 19500,
-    blurb: 'Synchroniser, check relay and load-sharing lines.',
+    cost: 14500,
+    blurb: 'Synchroscope, check-sync relay and load-sharing lines.',
     detail:
-      'Lets the set share a bus with others. Opens up the large multi-machine jobs where the real money is.',
+      'Lets the set be tied to a live bus. Brings a synchroscope onto the desk, and a check-sync relay that refuses a breaker close that would be violent — without it there is nothing between you and an out-of-phase close.',
     apply: (s) => {
       s.capabilities.push('parallel');
+      s.checkSync = true;
     },
   },
   {
