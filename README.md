@@ -1,9 +1,9 @@
 # Load Bank
 
 A career sim about operating, abusing and slowly rebuilding one 75 kW diesel
-generator.
+generator, presented as a 1963 generator control desk.
 
-You start with a tired set, $2,400 and no reputation. You take hire contracts,
+You start in April 1963 with a tired set, £2,400 and no reputation. You take hire contracts,
 keep the frequency inside the clause you signed, burn fuel you paid for, and put
 the margin back into the machine. Thirty-two upgrades across five branches take
 it from a naturally aspirated mechanical-governor unit that struggles at
@@ -13,10 +13,37 @@ machine delivering 132 kW.
 ```bash
 npm start      # http://localhost:8080
 npm test       # 45 tests over the physics and the career layer
+npm run apk    # build load-bank.apk  (needs ANDROID_SDK_ROOT)
 ```
 
 No build step and no runtime dependencies — plain ES modules. The server exists
 only because module imports need a real origin.
+
+## The 1963 desk
+
+The interface is one machine. Panels are hammertone-enamelled steel bolted to a
+frame at the corners; the readouts are moving-coil meters behind glass, with
+printed danger sectors and needles that swing past the mark and settle back —
+a real damped second-order movement, integrated every frame, not a bar that
+snaps to a value. Pilot lamps are jewelled glass in chrome bezels. The log
+spools out of a teleprinter, contracts arrive as carbon copies on manila, and
+the tech tree is a blueprint in the drawing office.
+
+Two typefaces are embedded in the page as base64 (SIL OFL): **Jost**, a Futura
+revival, for the engraved panel lettering, and **Cutive Mono** for the
+typewritten paperwork. Embedding them matters — inside the APK there is no
+network, and on Android a system fallback would substitute Roboto and lose the
+period entirely.
+
+Everything is drawn with CSS gradients and inline SVG. There is not one raster
+asset in the interface, so it stays sharp at any density and the whole app fits
+in a 136 KB APK.
+
+Prices are in period sterling and the date runs from 1 April 1963, but the
+economy is balanced for play rather than to 1963 price levels — and the upper
+tech tree (SCR aftertreatment, lithium buffers, organic Rankine cycles) runs
+well past what 1963 could actually build. The desk is the period piece; the
+engineering is allowed to be ahead of it.
 
 ## The machine is actually simulated
 
@@ -102,6 +129,34 @@ Space pauses; `1`–`6` set the time scale from 1× to 600×. The simulation is
 timestep-independent across that whole range — there is a test for it, because a
 governor loop that went unstable at 600× would quietly invent penalties.
 
+## Android
+
+`npm run apk` produces a sideloadable `load-bank.apk` (~136 KB). It needs an
+Android SDK with build-tools 34 and platform 34:
+
+```bash
+export ANDROID_SDK_ROOT=~/Android/Sdk
+npm run apk
+adb install -r load-bank.apk
+```
+
+The build drives `aapt2`, `javac`, `d8`, `zipalign` and `apksigner` directly
+rather than going through Gradle — the app is one Activity and a folder of
+static files, so there is no plugin resolution to go wrong.
+
+The shell is a WebView, but it does **not** load the game over `file://`. A
+`file://` document has an opaque origin, which would block every ES module
+import and make `localStorage` — the save file — unreliable. Instead
+`shouldInterceptRequest` answers a synthetic `https://loadbank.localhost`
+origin out of the APK's assets, so the page gets a proper secure origin while
+never touching the network. The manifest requests **no permissions at all**,
+including no `INTERNET`, so off-device access is impossible at the OS level.
+
+minSdk 24, targetSdk 34. Signed with a locally generated debug-grade key — fine
+for sideloading, not a Play Store upload key. The keystore is regenerated if
+missing, which changes the signature, so uninstall an older build before
+installing a freshly signed one.
+
 ## Layout
 
 ```
@@ -111,8 +166,16 @@ src/contracts.js   load profiles, clauses, settlement
 src/state.js       career state and the master tick
 src/ui.js          rendering; Operate is built once and patched per frame
 src/main.js        frame loop and event wiring
+fonts.css          embedded period typefaces (base64, OFL)
+android/           manifest, resources and the WebView Activity
+scripts/           APK build, browser smoke test, mobile layout check
 test/              45 tests
 ```
+
+Beyond the unit tests there are two browser checks (both need `npm i` and a
+running `npm start`): `npm run smoke` plays a full job end to end and fails on
+any console error, and `npm run mobile` renders every tab at phone and tablet
+sizes and fails on horizontal overflow.
 
 The physics core is pure and deterministic, which is why the interesting
 properties are testable at all: that BSFC lands in the real range, that an

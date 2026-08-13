@@ -6,7 +6,9 @@
   "scripts": {
     "start": "node server.mjs",
     "test": "node --test test/*.test.js",
-    "smoke": "node scripts/smoke.mjs"
+    "smoke": "node scripts/smoke.mjs",
+    "mobile": "node scripts/mobile-check.mjs",
+    "apk": "bash scripts/build-apk.sh"
   },
   "license": "MIT",
   "private": true,

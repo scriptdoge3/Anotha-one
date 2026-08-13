@@ -88,7 +88,7 @@ export function createGame() {
 }
 
 function fmtMoney(v) {
-  return `$${Math.round(v).toLocaleString('en-US')}`;
+  return `£${Math.round(v).toLocaleString('en-GB')}`;
 }
 
 /** Spec including anything bought outside the tech tree. */
@@ -168,7 +168,7 @@ export function refuel(g, litres = Infinity) {
   g.lifetimeFuelL += affordable;
   logLine(
     g,
-    `Took on ${affordable.toFixed(0)} L at $${unit.toFixed(2)}/L — ${fmtMoney(cost)}.`,
+    `Took on ${affordable.toFixed(0)} L at £${unit.toFixed(2)}/L — ${fmtMoney(cost)}.`,
     'info',
   );
   return { ok: true };

@@ -1,2 +1,10 @@
 node_modules/
+build/
 *.log
+
+# Generated on first APK build. Not committed: a signing key does not belong in
+# a repository, and this one is debug-grade anyway. Rebuilding regenerates it,
+# which changes the signature -- uninstall an older build before sideloading a
+# newly signed one.
+android/loadbank.keystore
+load-bank.apk.idsig

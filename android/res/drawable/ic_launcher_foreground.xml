@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A panel meter: cream dial, red danger arc, needle resting off zero.
+     Drawn inside the central 72dp safe zone of the 108dp adaptive canvas. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- dial face -->
+    <path
+        android:fillColor="#F2ECD8"
+        android:pathData="M25,32 L83,32 A3,3 0 0 1 86,35 L86,73 A3,3 0 0 1 83,76 L25,76 A3,3 0 0 1 22,73 L22,35 A3,3 0 0 1 25,32 Z" />
+
+    <!-- graduation arc -->
+    <path
+        android:strokeColor="#3A332A"
+        android:strokeWidth="2.4"
+        android:fillColor="#00000000"
+        android:strokeLineCap="butt"
+        android:pathData="M32,66 A28,28 0 0 1 76,66" />
+
+    <!-- red danger sector at the top of the scale -->
+    <path
+        android:strokeColor="#8E2A1C"
+        android:strokeWidth="5"
+        android:fillColor="#00000000"
+        android:strokeLineCap="butt"
+        android:pathData="M67.5,45.5 A28,28 0 0 1 76,66" />
+
+    <!-- needle -->
+    <path
+        android:strokeColor="#241F18"
+        android:strokeWidth="3.2"
+        android:strokeLineCap="round"
+        android:fillColor="#00000000"
+        android:pathData="M54,68 L44,44" />
+
+    <!-- pivot -->
+    <path
+        android:fillColor="#241F18"
+        android:pathData="M54,63 m-5,0 a5,5 0 1,0 10,0 a5,5 0 1,0 -10,0" />
+</vector>

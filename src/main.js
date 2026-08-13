@@ -51,7 +51,7 @@ function apply(result) {
 let lastOperateSig = null;
 let lastTop = '';
 
-function renderAll() {
+function renderAll(dt = 1 / 60) {
   // The header is cheap but still not worth rewriting 60 times a second.
   const top = renderTop(g);
   if (top !== lastTop) { el('topStats').innerHTML = top; lastTop = top; }
@@ -63,7 +63,7 @@ function renderAll() {
       lastOperateSig = sig;
       staticDirty = false;
     }
-    updateOperate(g, el('panel-operate'));
+    updateOperate(g, el('panel-operate'), dt);
     drawTrace(el('trace'), g);
   } else if (staticDirty) {
     if (activeTab === 'contracts') el('panel-contracts').innerHTML = renderContracts(g);
@@ -161,7 +161,7 @@ el('btnSave').addEventListener('click', () => {
 });
 
 el('btnReset').addEventListener('click', () => {
-  if (!confirm('Start a new career? Your current progress will be erased.')) return;
+  if (!confirm('Open a new yard? The current career will be erased.')) return;
   save.clear();
   g = createGame();
   settleShown = false;
@@ -210,7 +210,7 @@ function frame(now) {
   saveAccum += realDt;
   if (saveAccum > 20) { saveAccum = 0; save.save(g); }
 
-  renderAll();
+  renderAll(realDt);
   requestAnimationFrame(frame);
 }
 

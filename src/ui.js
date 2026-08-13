@@ -4,7 +4,7 @@
  * a stale listener bound to a node that has been replaced.
  */
 
-import { money, num, duration, escapeHtml } from './format.js';
+import { money, num, duration, escapeHtml, dayStamp, dateStamp } from './format.js';
 import { RATED_KW, rpmToHz, densityRatio, baseSpec } from './sim.js';
 import { TECH, BRANCHES, TECH_BY_ID, canResearch, lockedBy, buildSpec } from './tech.js';
 import {
@@ -19,13 +19,16 @@ export function renderTop(g) {
   const m = g.machine;
   const wearCls = m.wear > 80 ? 'bad' : m.wear > 50 ? 'warn' : '';
   const repTier = [5, 4, 3, 2, 1].find((t) => g.reputation >= TIER_REP[t]) ?? 1;
-  return `
-    <div class="stat"><span class="stat-label">Bank</span><span class="stat-value ${g.money < 500 ? 'warn' : 'good'}">${money(g.money)}</span></div>
-    <div class="stat"><span class="stat-label">Reputation</span><span class="stat-value">${g.reputation} <span class="faint" style="font-size:11px">T${repTier}</span></span></div>
-    <div class="stat"><span class="stat-label">Day</span><span class="stat-value">${g.day}</span></div>
-    <div class="stat"><span class="stat-label">Engine hours</span><span class="stat-value">${num(m.hours, 0)}</span></div>
-    <div class="stat"><span class="stat-label">Wear</span><span class="stat-value ${wearCls}">${num(m.wear, 1)}%</span></div>
-    <div class="stat"><span class="stat-label">Fuel</span><span class="stat-value">$${fuelPrice(g).toFixed(2)}/L</span></div>`;
+  const cell = (label, value, cls = '') =>
+    `<div class="stat"><span class="stat-label">${label}</span><span class="stat-value ${cls}">${value}</span></div>`;
+  return [
+    cell('Account', money(g.money), g.money < 500 ? 'warn' : 'good'),
+    cell('Standing', `${g.reputation} <span style="font-size:9px;opacity:.65">T${repTier}</span>`),
+    cell('Date', dateStamp(g.day)),
+    cell('Run Hrs', num(m.hours, 0)),
+    cell('Wear', `${num(m.wear, 1)}%`, wearCls),
+    cell('Fuel', `£${fuelPrice(g).toFixed(2)}`),
+  ].join('');
 }
 
 // ----------------------------------------------------------------- operate
@@ -35,92 +38,227 @@ export function renderTop(g) {
  * once and then patched in place. Re-rendering its innerHTML each tick would
  * detach the buttons mid-click and destroy the trace canvas 60 times a second.
  *
- * `gaugeSpecs` and `lampSpecs` are the single source of truth for both the
+ * `meterSpecs` and `lampSpecs` are the single source of truth for both the
  * initial build and the per-frame update, so the two can never drift apart.
  */
 
-function gaugeSpecs(g) {
+// ---- moving-coil meter geometry -------------------------------------------
+// A panel meter of the period sweeps about 110 degrees, pivoting below the
+// dial. Everything below is in the SVG's own 168x112 coordinate space.
+
+const M_W = 168, M_H = 104;
+const PIVOT_X = 84, PIVOT_Y = 92;
+const R_SCALE = 68;          // radius of the graduation arc
+const R_NEEDLE = 61;
+const SWEEP = 55;            // degrees either side of vertical
+
+/** Point on the dial at `deg` from vertical (clockwise positive). */
+function dialPt(r, deg) {
+  const a = (deg * Math.PI) / 180;
+  return [PIVOT_X + r * Math.sin(a), PIVOT_Y - r * Math.cos(a)];
+}
+
+const fracToDeg = (f) => -SWEEP + 2 * SWEEP * clamp01(f);
+const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
+
+/** Arc path along the dial between two fractions of full scale. */
+function dialArc(f0, f1, r) {
+  const [x0, y0] = dialPt(r, fracToDeg(f0));
+  const [x1, y1] = dialPt(r, fracToDeg(f1));
+  return `M${x0.toFixed(2)},${y0.toFixed(2)} A${r},${r} 0 0 1 ${x1.toFixed(2)},${y1.toFixed(2)}`;
+}
+
+/**
+ * Build one meter. `bands` paints coloured sectors on the scale (the red
+ * danger zone, the green tolerance band), exactly as a real dial is printed.
+ */
+function meterSvg(s) {
+  const ticks = [];
+  const majors = s.majors ?? 5;
+  const minors = majors * 4;
+  for (let i = 0; i <= minors; i++) {
+    const f = i / minors;
+    const major = i % 4 === 0;
+    const [xa, ya] = dialPt(R_SCALE, fracToDeg(f));
+    const [xb, yb] = dialPt(R_SCALE - (major ? 9 : 5), fracToDeg(f));
+    ticks.push(
+      `<line x1="${xa.toFixed(2)}" y1="${ya.toFixed(2)}" x2="${xb.toFixed(2)}" y2="${yb.toFixed(2)}"
+        stroke="#2a241c" stroke-width="${major ? 1.5 : 0.7}" />`,
+    );
+    if (major) {
+      const [xt, yt] = dialPt(R_SCALE - 19, fracToDeg(f));
+      const edge = xt < 16 ? 'start' : xt > M_W - 16 ? 'end' : 'middle';
+      const val = s.min + (s.max - s.min) * f;
+      ticks.push(
+        `<text x="${xt.toFixed(2)}" y="${(yt + 3.4).toFixed(2)}" text-anchor="${edge}"
+          font-family="Jost, sans-serif" font-size="9.5" fill="#2a241c">${
+            Math.abs(val) >= 100 ? val.toFixed(0) : val.toFixed(s.tickDp ?? 0)
+          }</text>`,
+      );
+    }
+  }
+
+  const bands = (s.bands ?? [])
+    .map((b) => `<path d="${dialArc(b.from, b.to, R_SCALE + 3.5)}" stroke="${b.color}"
+      stroke-width="4.5" fill="none" stroke-linecap="butt" />`)
+    .join('');
+
+  return `<svg viewBox="0 0 ${M_W} ${M_H}" role="img" aria-label="${s.label}">
+    <defs>
+      <linearGradient id="face-${s.key}" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0" stop-color="#f6f0dd"/><stop offset="1" stop-color="#ded5bb"/>
+      </linearGradient>
+      <radialGradient id="glass-${s.key}" cx="0.3" cy="0.12" r="0.9">
+        <stop offset="0" stop-color="#ffffff" stop-opacity="0.4"/>
+        <stop offset="0.45" stop-color="#ffffff" stop-opacity="0.05"/>
+        <stop offset="1" stop-color="#000000" stop-opacity="0.12"/>
+      </radialGradient>
+    </defs>
+    <rect x="1" y="1" width="${M_W - 2}" height="${M_H - 2}" rx="3" fill="url(#face-${s.key})" stroke="#8d8878"/>
+    ${bands}
+    ${ticks.join('')}
+    <text x="${PIVOT_X}" y="80" text-anchor="middle" font-family="Jost, sans-serif"
+      font-size="9" letter-spacing="1.6" fill="#7a7160">${s.unit ?? ''}</text>
+    <g data-needle transform="rotate(${fracToDeg(0)} ${PIVOT_X} ${PIVOT_Y})">
+      <line x1="${PIVOT_X}" y1="${PIVOT_Y}" x2="${PIVOT_X}" y2="${PIVOT_Y - R_NEEDLE}"
+        stroke="#1d1812" stroke-width="1.9" stroke-linecap="round"/>
+      <line x1="${PIVOT_X}" y1="${PIVOT_Y}" x2="${PIVOT_X}" y2="${PIVOT_Y + 7}"
+        stroke="#1d1812" stroke-width="3.4" stroke-linecap="round"/>
+    </g>
+    <circle cx="${PIVOT_X}" cy="${PIVOT_Y}" r="5.5" fill="#2b241c"/>
+    <circle cx="${PIVOT_X}" cy="${PIVOT_Y}" r="2.2" fill="#8d8878"/>
+    <rect x="1" y="1" width="${M_W - 2}" height="${M_H - 2}" rx="3" fill="url(#glass-${s.key})"/>
+  </svg>`;
+}
+
+const RED = '#8e2a1c';
+const GREEN = '#4a7a3a';
+const AMBER = '#b3831a';
+
+function meterSpecs(g) {
   const m = g.machine;
   const spec = g.spec;
   const job = g.job;
   const hz = m.hz ?? 0;
   const demand = job && !job.done ? demandAt(job.contract.profile, job.progress.elapsedH) : 0;
-
   const tol = job && !job.done ? job.contract.freqTolHz : 2;
   const hzErr = Math.abs(hz - 60);
   const fuelPct = (m.fuelL / spec.tankL) * 100;
   const endurance = m.fuelLPerH > 0.2 ? m.fuelL / m.fuelLPerH : Infinity;
   const voltTol = job && !job.done ? job.contract.voltTolPct : 10;
+  const kwMax = Math.ceil(spec.altRatingKW / 20) * 20;
 
   const out = [
     {
-      key: 'hz', label: 'Frequency', value: num(hz, 2), unit: 'Hz',
+      key: 'hz', label: 'Frequency', unit: 'HERTZ',
+      min: 55, max: 65, majors: 5, value: hz,
+      display: `${num(hz, 2)} Hz`,
       sub: `${num(m.rpm, 0)} rpm · tol ±${num(tol, 2)}`,
-      pct: (hz / 63) * 100,
+      bands: [
+        { from: 0, to: 0.2, color: RED },
+        { from: (60 - tol - 55) / 10, to: (60 + tol - 55) / 10, color: GREEN },
+        { from: 0.85, to: 1, color: RED },
+      ],
       state: !m.running ? '' : hzErr > tol ? 'alarm' : hzErr > tol * 0.6 ? 'warn' : '',
-      color: !m.running ? 'var(--ink-faint)' : hzErr > tol ? 'var(--red)' : 'var(--green)',
     },
     {
-      key: 'kw', label: 'Output', value: num(m.deliveredKW, 1), unit: 'kW',
-      sub: `demand ${num(demand, 1)} kW${m.shedKW > 0.5 ? ` · SHED ${num(m.shedKW, 1)}` : ''}`,
-      pct: (m.deliveredKW / spec.altRatingKW) * 100,
+      key: 'kw', label: 'Output', unit: 'KILOWATT',
+      min: 0, max: kwMax, majors: 5, value: m.deliveredKW,
+      display: `${num(m.deliveredKW, 1)} kW`,
+      sub: `demand ${num(demand, 1)}${m.shedKW > 0.5 ? ` · SHED ${num(m.shedKW, 1)}` : ''}`,
+      bands: [{ from: RATED_KW / kwMax, to: 1, color: AMBER }],
       state: m.shedKW > 0.5 ? 'alarm' : m.deliveredKW > RATED_KW ? 'warn' : '',
-      color: m.deliveredKW > RATED_KW ? 'var(--amber)' : 'var(--blue)',
     },
     {
-      key: 'v', label: 'Voltage', value: num(m.volts, 0), unit: 'V',
+      key: 'v', label: 'Voltage', unit: 'VOLTS',
+      min: 400, max: 560, majors: 4, value: m.volts,
+      display: `${num(m.volts, 0)} V`,
       sub: `nominal 480 · ${num(((m.volts - 480) / 480) * 100, 1)}%`,
-      pct: (m.volts / 520) * 100,
+      bands: [{ from: (480 * (1 - voltTol / 100) - 400) / 160, to: (480 * (1 + voltTol / 100) - 400) / 160, color: GREEN }],
       state: m.running && Math.abs(m.volts - 480) / 480 > voltTol / 100 ? 'alarm' : '',
-      color: 'var(--violet)',
     },
     {
-      key: 'temp', label: 'Coolant', value: num(m.coolantC, 1), unit: '°C',
+      key: 'temp', label: 'Coolant', unit: 'DEG C',
+      min: 0, max: 130, majors: 5, value: m.coolantC,
+      display: `${num(m.coolantC, 1)} °C`,
       sub: m.coolantC > 103 ? 'DERATING' : `fan ${num((m.fanCmd ?? 1) * 100, 0)}%`,
-      pct: (m.coolantC / 125) * 100,
+      bands: [{ from: 105 / 130, to: 1, color: RED }],
       state: m.coolantC > 110 ? 'alarm' : m.coolantC > 100 ? 'warn' : '',
-      color: m.coolantC > 110 ? 'var(--red)' : 'var(--blue)',
     },
     {
-      key: 'fuel', label: 'Fuel', value: num(m.fuelL, 0), unit: 'L',
-      sub: `${num(m.fuelLPerH, 1)} L/h · ${duration(endurance)} left`,
-      pct: fuelPct,
+      key: 'fuel', label: 'Fuel', unit: 'LITRES',
+      min: 0, max: spec.tankL, majors: 4, value: m.fuelL,
+      display: `${num(m.fuelL, 0)} L`,
+      sub: `${num(m.fuelLPerH, 1)} L/h · ${duration(endurance)}`,
+      bands: [{ from: 0, to: 0.12, color: RED }],
       state: fuelPct < 8 ? 'alarm' : fuelPct < 20 ? 'warn' : '',
-      color: fuelPct < 8 ? 'var(--red)' : 'var(--amber)',
     },
     spec.boostGain > 0
       ? {
-          key: 'boost', label: 'Boost', value: num(m.boost * 100, 0), unit: '%',
-          sub: `rack ${num(m.fuelCmd * 100, 0)}% · τ ${num(spec.boostTau, 2)} s`,
-          pct: m.boost * 100, state: '', color: 'var(--amber)',
+          key: 'boost', label: 'Boost', unit: 'PER CENT',
+          min: 0, max: 100, majors: 4, value: m.boost * 100,
+          display: `${num(m.boost * 100, 0)}%`,
+          sub: `rack ${num(m.fuelCmd * 100, 0)}% · τ ${num(spec.boostTau, 2)}s`,
+          state: '',
         }
       : {
-          key: 'boost', label: 'Fuel rack', value: num(m.fuelCmd * 100, 0), unit: '%',
+          key: 'boost', label: 'Fuel Rack', unit: 'PER CENT',
+          min: 0, max: 100, majors: 4, value: m.fuelCmd * 100,
+          display: `${num(m.fuelCmd * 100, 0)}%`,
           sub: 'naturally aspirated',
-          pct: m.fuelCmd * 100, state: '', color: 'var(--amber)',
+          state: '',
         },
     {
-      key: 'smoke', label: 'Smoke', value: num(m.smoke * 100, 0), unit: '%',
-      sub: m.smoke > 0.08 ? 'over-fuelling — air limited' : 'clean',
-      pct: m.smoke * 100,
+      key: 'smoke', label: 'Opacity', unit: 'PER CENT',
+      min: 0, max: 100, majors: 4, value: m.smoke * 100,
+      display: `${num(m.smoke * 100, 0)}%`,
+      sub: m.smoke > 0.08 ? 'over-fuelling' : 'clean',
+      bands: [{ from: 0.4, to: 1, color: RED }],
       state: m.smoke > 0.3 ? 'alarm' : m.smoke > 0.08 ? 'warn' : '',
-      color: 'var(--red)',
     },
     spec.batteryKWh > 0
       ? {
-          key: 'batt', label: 'Battery', value: num(m.batterySoc * 100, 0), unit: '%',
-          sub: `${m.batteryFlowKW > 0 ? 'discharging ' : m.batteryFlowKW < 0 ? 'charging ' : 'idle '}${num(Math.abs(m.batteryFlowKW), 1)} kW`,
-          pct: m.batterySoc * 100, state: '', color: 'var(--green)',
+          key: 'batt', label: 'Battery', unit: 'PER CENT',
+          min: 0, max: 100, majors: 4, value: m.batterySoc * 100,
+          display: `${num(m.batterySoc * 100, 0)}%`,
+          sub: `${m.batteryFlowKW > 0 ? 'disch ' : m.batteryFlowKW < 0 ? 'chg ' : 'idle '}${num(Math.abs(m.batteryFlowKW), 1)} kW`,
+          bands: [{ from: 0, to: 0.15, color: RED }],
+          state: '',
         }
       : {
-          key: 'wear', label: 'Engine wear', value: num(m.wear, 1), unit: '%',
+          key: 'wear', label: 'Engine Wear', unit: 'PER CENT',
+          min: 0, max: 100, majors: 4, value: m.wear,
+          display: `${num(m.wear, 1)}%`,
           sub: `${num(m.hoursSinceService, 0)} h since service`,
-          pct: m.wear,
+          bands: [{ from: 0.75, to: 1, color: RED }],
           state: m.wear > 80 ? 'alarm' : m.wear > 50 ? 'warn' : '',
-          color: m.wear > 80 ? 'var(--red)' : 'var(--amber)',
         },
   ];
+  for (const s of out) s.frac = clamp01((s.value - s.min) / (s.max - s.min));
   return out;
+}
+
+/**
+ * Needle dynamics. A moving-coil movement is a damped second-order system: it
+ * swings past the mark and settles back. Simulating that rather than snapping
+ * the needle is most of what makes the panel feel like hardware.
+ */
+const needles = new Map();
+const NEEDLE_W = 21;     // natural frequency, rad/s
+const NEEDLE_ZETA = 0.62; // under-damped, so it overshoots a little
+
+function needleAngle(key, targetDeg, dt) {
+  let s = needles.get(key);
+  if (!s) { s = { v: targetDeg, dv: 0 }; needles.set(key, s); }
+  // Sub-step so a long frame cannot make the movement explode.
+  let t = Math.min(dt, 0.1);
+  while (t > 0) {
+    const h = Math.min(t, 1 / 120);
+    s.dv += (NEEDLE_W * NEEDLE_W * (targetDeg - s.v) - 2 * NEEDLE_ZETA * NEEDLE_W * s.dv) * h;
+    s.v += s.dv * h;
+    t -= h;
+  }
+  return s.v;
 }
 
 function lampSpecs(g) {
@@ -129,37 +267,23 @@ function lampSpecs(g) {
   const fuelPct = (m.fuelL / spec.tankL) * 100;
   const lamps = [
     { key: 'run', label: 'Running', on: m.running, color: 'green' },
-    { key: 'load', label: 'On load', on: m.breakerClosed, color: 'green' },
+    { key: 'load', label: 'On Load', on: m.breakerClosed, color: 'green' },
     { key: 'crank', label: 'Cranking', on: m.cranking > 0, color: 'amber' },
-    { key: 'temp', label: 'Over-temp', on: m.coolantC > 105, color: 'red' },
+    { key: 'temp', label: 'Over Temp', on: m.coolantC > 105, color: 'red' },
     { key: 'over', label: 'Overload', on: m.shedKW > 0.5, color: 'red' },
-    { key: 'lowfuel', label: 'Low fuel', on: fuelPct < 20, color: 'amber' },
-    { key: 'svc', label: 'Service due', on: m.hoursSinceService > 250, color: 'amber' },
+    { key: 'lowfuel', label: 'Low Fuel', on: fuelPct < 20, color: 'amber' },
+    { key: 'svc', label: 'Service', on: m.hoursSinceService > 250, color: 'amber' },
   ];
   if (spec.capabilities.includes('dpf')) {
-    lamps.push({
-      key: 'dpf', label: `DPF ${num(m.dpfLoad * 100, 0)}%`,
-      on: m.dpfLoad > 0.7, color: 'amber',
-    });
+    lamps.push({ key: 'dpf', label: `Filter ${num(m.dpfLoad * 100, 0)}%`, on: m.dpfLoad > 0.7, color: 'amber' });
   }
   return lamps;
 }
 
-function gaugeHtml(s) {
-  return `<div class="gauge ${s.state ? `is-${s.state}` : ''}" data-gauge="${s.key}">
-    <div class="gauge-label">${s.label}</div>
-    <div class="gauge-value" data-f="value">${s.value}<span class="gauge-unit">${s.unit ?? ''}</span></div>
-    <div class="gauge-sub" data-f="sub">${s.sub ?? ''}</div>
-    <div class="bar"><div class="bar-fill" data-f="bar" style="width:${clampPct(s.pct)}%;background:${s.color}"></div></div>
-  </div>`;
-}
-
-const clampPct = (v) => Math.max(0, Math.min(100, v ?? 0));
-
 /**
  * Structural signature. When this changes the panel is rebuilt; otherwise it is
- * only patched. It covers everything that changes the *shape* of the panel
- * rather than its values.
+ * only patched. It covers everything that changes the *shape* of the panel or
+ * the printed scale of a meter, rather than the value on it.
  */
 export function operateSignature(g) {
   const spec = g.spec;
@@ -170,16 +294,28 @@ export function operateSignature(g) {
     spec.boostGain > 0,
     spec.capabilities.includes('dpf'),
     !!g.job?.contract.thermalPayPerKWh,
+    spec.altRatingKW,      // redraws the kW scale
+    spec.tankL,            // redraws the fuel scale
   ].join('|');
 }
 
 export function renderOperate(g) {
-  const gauges = gaugeSpecs(g).map(gaugeHtml).join('');
-  const lamps = lampSpecs(g)
-    .map((l) => `<div class="lamp ${l.on ? `on ${l.color}` : ''}" data-lamp="${l.key}"><span class="lamp-dot"></span><span data-f="label">${l.label}</span></div>`)
+  const meters = meterSpecs(g)
+    .map((s) => `<div class="meter" data-meter="${s.key}">
+        ${meterSvg(s)}
+        <div class="meter-plate">${s.label}<span class="meter-read" data-f="read">${s.display}</span></div>
+        <div class="meter-sub" data-f="sub">${s.sub ?? ''}</div>
+      </div>`)
     .join('');
+
+  const lamps = lampSpecs(g)
+    .map((l) => `<div class="lamp ${l.on ? `on ${l.color}` : ''}" data-lamp="${l.key}">
+        <span class="lamp-dot"></span><span class="lamp-label" data-f="label">${l.label}</span>
+      </div>`)
+    .join('');
+
   const speedBtns = SPEEDS.map(
-    (s) => `<button class="speed-btn" data-speed="${s}">${s === 0 ? '❚❚' : `${s}×`}</button>`,
+    (s) => `<button class="speed-btn" data-speed="${s}">${s === 0 ? 'HOLD' : `${s}×`}</button>`,
   ).join('');
 
   return `
@@ -187,67 +323,61 @@ export function renderOperate(g) {
     <div class="stack">
       <div class="card">
         <div class="card-head">
-          <span class="card-title">Control panel</span>
+          <span class="card-title">Control Desk</span>
           <div class="speed-group" data-speeds>${speedBtns}</div>
         </div>
         <div class="card-body stack">
           <div class="controls">
             <button class="btn" data-act="start">Start</button>
             <button class="btn" data-act="stop">Stop</button>
-            <button class="btn" data-act="breaker">Close breaker</button>
-            <button class="btn" data-act="refuel">Refuel to full</button>
+            <button class="btn" data-act="breaker">Close Breaker</button>
+            <button class="btn" data-act="refuel">Refuel</button>
           </div>
           <div class="lamp-row">${lamps}</div>
         </div>
       </div>
 
       <div class="card">
-        <div class="card-head"><span class="card-title">Instruments</span></div>
-        <div class="card-body"><div class="gauge-grid">${gauges}</div></div>
+        <div class="card-head"><span class="card-title">Instrument Bank</span></div>
+        <div class="card-body"><div class="meter-grid">${meters}</div></div>
       </div>
 
       <div class="card">
         <div class="card-head">
-          <span class="card-title">Frequency &amp; load trace</span>
-          <span class="faint mono" style="font-size:10px">last 60 s</span>
+          <span class="card-title">Chart Recorder</span>
+          <span class="faint mono" style="font-size:9.5px">60 SEC</span>
         </div>
-        <div class="card-body"><canvas class="trace" id="trace"></canvas></div>
+        <div class="card-body"><div class="trace-window"><canvas class="trace" id="trace"></canvas></div></div>
       </div>
     </div>
 
     <div class="stack">
       ${renderJobCard(g)}
       <div class="card">
-        <div class="card-head"><span class="card-title">Log</span></div>
+        <div class="card-head"><span class="card-title">Day Log</span></div>
         <div class="card-body"><div class="log" data-log></div></div>
       </div>
     </div>
   </div>`;
 }
 
-/** Per-frame patch. Touches only text and style, never structure. */
-export function updateOperate(g, root) {
+/** Per-frame patch. Touches only attributes and text, never structure. */
+export function updateOperate(g, root, dt = 1 / 60) {
   if (!root) return;
   const m = g.machine;
 
-  for (const s of gaugeSpecs(g)) {
-    const node = root.querySelector(`[data-gauge="${s.key}"]`);
+  for (const s of meterSpecs(g)) {
+    const node = root.querySelector(`[data-meter="${s.key}"]`);
     if (!node) continue;
-    const val = node.querySelector('[data-f="value"]');
-    const unit = val.querySelector('.gauge-unit');
-    // Replace only the leading text node so the unit span survives.
-    if (val.firstChild && val.firstChild.nodeType === 3) {
-      if (val.firstChild.nodeValue !== s.value) val.firstChild.nodeValue = s.value;
+    const needle = node.querySelector('[data-needle]');
+    if (needle) {
+      const a = needleAngle(s.key, fracToDeg(s.frac), dt);
+      needle.setAttribute('transform', `rotate(${a.toFixed(2)} ${PIVOT_X} ${PIVOT_Y})`);
     }
-    if (unit && unit.textContent !== (s.unit ?? '')) unit.textContent = s.unit ?? '';
+    const read = node.querySelector('[data-f="read"]');
+    if (read && read.textContent !== s.display) read.textContent = s.display;
     const sub = node.querySelector('[data-f="sub"]');
     if (sub && sub.textContent !== (s.sub ?? '')) sub.textContent = s.sub ?? '';
-    const bar = node.querySelector('[data-f="bar"]');
-    if (bar) {
-      const w = `${clampPct(s.pct)}%`;
-      if (bar.style.width !== w) bar.style.width = w;
-      if (bar.style.background !== s.color) bar.style.background = s.color;
-    }
     node.classList.toggle('is-alarm', s.state === 'alarm');
     node.classList.toggle('is-warn', s.state === 'warn');
   }
@@ -255,7 +385,8 @@ export function updateOperate(g, root) {
   for (const l of lampSpecs(g)) {
     const node = root.querySelector(`[data-lamp="${l.key}"]`);
     if (!node) continue;
-    node.className = `lamp ${l.on ? `on ${l.color}` : ''}`;
+    const cls = `lamp ${l.on ? `on ${l.color}` : ''}`;
+    if (node.className !== cls) node.className = cls;
     const label = node.querySelector('[data-f="label"]');
     if (label && label.textContent !== l.label) label.textContent = l.label;
   }
@@ -267,7 +398,7 @@ export function updateOperate(g, root) {
     if (!b) return;
     if (b.disabled !== disabled) b.disabled = disabled;
     if (text !== undefined && b.textContent !== text) b.textContent = text;
-    if (cls !== undefined) b.className = cls;
+    if (cls !== undefined && b.className !== cls) b.className = cls;
   };
   setBtn('[data-act="start"]', {
     disabled: m.running || m.cranking > 0,
@@ -275,8 +406,8 @@ export function updateOperate(g, root) {
   });
   setBtn('[data-act="stop"]', { disabled: !m.running });
   setBtn('[data-act="breaker"]', {
-    disabled: !m.running,
-    text: m.breakerClosed ? 'Open breaker' : 'Close breaker',
+    disabled: !m.running && m.cranking <= 0,
+    text: m.breakerClosed ? 'Open Breaker' : 'Close Breaker',
     cls: `btn ${m.breakerClosed ? 'btn-danger' : ''}`,
   });
 
@@ -284,7 +415,6 @@ export function updateOperate(g, root) {
     b.classList.toggle('is-active', Number(b.dataset.speed) === g.speed);
   }
 
-  // Job card figures.
   const job = g.job;
   if (job && !job.done) {
     const { contract: c, progress: p } = job;
@@ -314,13 +444,12 @@ export function updateOperate(g, root) {
     set('thermal', `${num(p.thermalKWh, 0)} kWh`);
   }
 
-  // The log only changes when something is appended.
   const logEl = root.querySelector('[data-log]');
   if (logEl && Number(logEl.dataset.len || -1) !== g.log.length) {
     logEl.dataset.len = String(g.log.length);
     logEl.innerHTML =
       g.log
-        .map((l) => `<div class="log-line ${l.kind}"><span class="log-day">D${l.day}</span><span class="log-text">${escapeHtml(l.text)}</span></div>`)
+        .map((l) => `<div class="log-line ${l.kind}"><span class="log-day">${escapeHtml(dayStamp(l.day))}</span><span class="log-text">${escapeHtml(l.text)}</span></div>`)
         .join('') || '<div class="faint">Nothing yet.</div>';
   }
 }
@@ -328,35 +457,35 @@ export function updateOperate(g, root) {
 function renderJobCard(g) {
   const job = g.job;
   if (!job) {
-    return `<div class="card"><div class="card-head"><span class="card-title">Current job</span></div>
-      <div class="card-body"><div class="empty-note">No job on.<br /><span class="faint">Take one from the Contracts board.</span></div></div></div>`;
+    return `<div class="card"><div class="card-head"><span class="card-title">Job Docket</span></div>
+      <div class="card-body"><div class="empty-note">No job on the books.<br />Take one from the contracts board.</div></div></div>`;
   }
   const { contract: c } = job;
   const kv = (key, label) =>
     `<div><div class="kv-label">${label}</div><div class="kv-value" data-job="${key}">—</div></div>`;
 
   return `<div class="card">
-    <div class="card-head"><span class="card-title">Current job</span>
+    <div class="card-head"><span class="card-title">Job Docket</span>
       <button class="btn btn-sm btn-danger" data-act="abandon">Abandon</button></div>
     <div class="card-body stack">
       <div>
-        <div class="job-head"><span class="job-title">${escapeHtml(c.title)}</span></div>
+        <div class="job-title">${escapeHtml(c.title)}</div>
         <div class="job-client">${escapeHtml(c.client)}</div>
         <div class="progress-track"><div class="progress-fill" data-job="fill" style="width:0%"></div></div>
         <div class="row" style="justify-content:space-between">
-          <span class="faint mono" style="font-size:11px" data-job="elapsed"></span>
-          <span class="faint mono" style="font-size:11px" data-job="pctdone"></span>
+          <span class="faint mono" style="font-size:10.5px" data-job="elapsed"></span>
+          <span class="faint mono" style="font-size:10.5px" data-job="pctdone"></span>
         </div>
       </div>
       <div class="kv-grid">
         ${kv('energy', 'Delivered')}
-        ${kv('supply', 'Supply met')}
+        ${kv('supply', 'Supply Met')}
         ${kv('outage', 'Shortfall')}
-        ${kv('freq', 'Freq. faults')}
-        ${kv('volt', 'Volt faults')}
+        ${kv('freq', 'Freq Faults')}
+        ${kv('volt', 'Volt Faults')}
         ${kv('trips', 'Trips')}
-        ${kv('fuelused', 'Fuel used')}
-        ${c.thermalPayPerKWh ? kv('thermal', 'Heat sold') : ''}
+        ${kv('fuelused', 'Fuel Used')}
+        ${c.thermalPayPerKWh ? kv('thermal', 'Heat Sold') : ''}
       </div>
       <div class="chip-row">
         <span class="chip">±${num(c.freqTolHz, 2)} Hz</span>
@@ -382,8 +511,8 @@ function sparkline(profile, hours, w = 300, h = 40) {
     .join(' ');
   const ratedY = h - (RATED_KW / max) * (h - 4) - 2;
   return `<svg class="profile-spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
-    ${ratedY > 0 && ratedY < h ? `<line x1="0" y1="${ratedY}" x2="${w}" y2="${ratedY}" stroke="#3a4550" stroke-width="1" stroke-dasharray="3 3"/>` : ''}
-    <polyline points="${pts}" fill="none" stroke="var(--amber)" stroke-width="1.5" vector-effect="non-scaling-stroke"/>
+    ${ratedY > 0 && ratedY < h ? `<line x1="0" y1="${ratedY}" x2="${w}" y2="${ratedY}" stroke="rgba(0,0,0,0.42)" stroke-width="1" stroke-dasharray="4 3" vector-effect="non-scaling-stroke"/>` : ''}
+    <polyline points="${pts}" fill="none" stroke="#8e2a1c" stroke-width="1.6" vector-effect="non-scaling-stroke"/>
   </svg>`;
 }
 
@@ -453,8 +582,8 @@ export function renderContracts(g) {
 
   return `
     <div class="row" style="justify-content:space-between;margin-bottom:14px">
-      <h2 class="section-title" style="margin:0">Available work — reputation ${g.reputation}</h2>
-      <button class="btn btn-sm" data-act="refresh-board">Ring round for new work (1 day)</button>
+      <h2 class="section-title" style="margin:0">Hire Desk — standing ${g.reputation}</h2>
+      <button class="btn btn-sm" data-act="refresh-board">Ring Round (1 day)</button>
     </div>
     <div class="contract-grid">${cards}</div>`;
 }
@@ -523,19 +652,22 @@ export function renderTech(g) {
       const mid = (y1 + y2) / 2;
       const active = owned.has(r) && owned.has(t.id);
       const reachable = owned.has(r);
+      // Drafted in white line on the blueprint; routes you have already built
+      // are inked in green, ones you could build next in gold.
       return `<path d="M${x1},${y1} C${x1},${mid} ${x2},${mid} ${x2},${y2}"
-        fill="none" stroke="${active ? 'var(--green)' : reachable ? 'var(--amber-dim)' : '#242a30'}"
-        stroke-width="${active ? 2.2 : 1.4}" />`;
+        fill="none" stroke="${active ? '#7ddc8e' : reachable ? '#e8b957' : 'rgba(168,206,235,0.42)'}"
+        stroke-width="${active ? 2.2 : 1.3}"
+        stroke-dasharray="${active || reachable ? 'none' : '5 4'}" />`;
     }),
   ).join('');
 
   const laneBg = lanes
-    .map((l) => `<rect x="${l.x - 10}" y="${PAD_Y - 22}" width="${l.w + 20}" height="${height - PAD_Y + 24}"
-      rx="10" fill="hsl(${l.hue} 40% 50% / 0.035)" stroke="hsl(${l.hue} 40% 50% / 0.10)" />`)
+    .map((l) => `<rect x="${l.x - 10}" y="${PAD_Y - 24}" width="${l.w + 20}" height="${height - PAD_Y + 26}"
+      rx="3" fill="rgba(255,255,255,0.030)" stroke="rgba(168,206,235,0.22)" stroke-dasharray="7 5" />`)
     .join('');
 
   const heads = lanes
-    .map((l) => `<div class="branch-head" style="left:${l.x}px;top:12px;width:${l.w}px;color:hsl(${l.hue} 60% 62%)">${l.name}</div>`)
+    .map((l) => `<div class="branch-head" style="left:${l.x}px;top:12px;width:${l.w}px;color:hsl(${l.hue} 75% 76%)">${l.name}</div>`)
     .join('');
 
   const nodes = TECH.map((t) => {
@@ -563,7 +695,7 @@ export function renderTech(g) {
 
   return `
     <div class="row" style="justify-content:space-between;margin-bottom:12px">
-      <h2 class="section-title" style="margin:0">Development programme — ${g.owned.length}/${TECH.length} fitted</h2>
+      <h2 class="section-title" style="margin:0">Drawing Office — ${g.owned.length}/${TECH.length} modifications fitted</h2>
       <span class="faint" style="font-size:12px">Click a node for detail · scroll sideways for all five branches · upgrades fit between jobs only</span>
     </div>
     <div class="tech-wrap"><div class="tech-canvas" style="height:${height}px;width:${width}px">
@@ -596,7 +728,7 @@ export function techModal(g, id) {
   return `
     <h2>${escapeHtml(t.name)}</h2>
     <div class="modal-sub">${BRANCHES.find((b) => b.id === t.branch).name} · ${money(t.cost)}</div>
-    <p style="color:var(--ink-dim);font-size:13.5px;line-height:1.6">${escapeHtml(t.detail)}</p>
+    <p style="font-size:12.5px;line-height:1.65">${escapeHtml(t.detail)}</p>
     ${reqNames || excl ? `<div class="chip-row" style="margin:12px 0">${reqNames}${excl}</div>` : ''}
     ${rows ? `<h3 class="section-title" style="margin-top:18px">Effect on the machine</h3>
       <table class="spec-table">${rows}</table>` : ''}
@@ -733,16 +865,16 @@ export function renderWorkshop(g) {
     <div class="stack">
       ${busy ? '<div class="card"><div class="card-body"><span class="chip warn">A job is running — servicing and upgrades are unavailable until it ends.</span></div></div>' : ''}
       <div>
-        <h2 class="section-title">Maintenance &amp; consumables</h2>
+        <h2 class="section-title">Maintenance &amp; Consumables</h2>
         <div class="shop-grid">${services}${tank}${fuelBuy}</div>
       </div>
       <div class="shop-grid">
         <div class="card">
-          <div class="card-head"><span class="card-title">Machine specification</span></div>
+          <div class="card-head"><span class="card-title">Machine Specification</span></div>
           <div class="card-body"><table class="spec-table">${specRows}</table></div>
         </div>
         <div class="card">
-          <div class="card-head"><span class="card-title">Career record</span></div>
+          <div class="card-head"><span class="card-title">Yard Record</span></div>
           <div class="card-body"><table class="spec-table">${career}</table></div>
         </div>
       </div>
@@ -759,7 +891,7 @@ export function settlementModal(g, job) {
 
   return `
     <h2>${r.failed ? 'Contract failed' : r.clean ? 'Clean run' : 'Job complete'}</h2>
-    <div class="modal-sub">${escapeHtml(c.title)} · ${escapeHtml(c.client)}</div>
+    <div class="modal-sub">${escapeHtml(c.title)} · ${escapeHtml(c.client)} · ${dateStamp(g.day)}</div>
     <table class="settle-table">
       ${rows}
       <tr><td class="faint">Less mobilisation advance already paid</td><td class="faint">${money(-(r.advance ?? 0))}</td></tr>
@@ -767,10 +899,11 @@ export function settlementModal(g, job) {
         <td class="${(r.net ?? 0) >= 0 ? 'pos' : 'neg'}">${money(r.net ?? r.total)}</td></tr>
     </table>
     <div class="chip-row">
-      <span class="chip ${r.repDelta >= 0 ? 'req-ok' : 'req-miss'}">Reputation ${r.repDelta >= 0 ? '+' : ''}${r.repDelta}</span>
+      <span class="chip ${r.repDelta >= 0 ? 'req-ok' : 'req-miss'}">Standing ${r.repDelta >= 0 ? '+' : ''}${r.repDelta}</span>
       <span class="chip">Supply met ${num(r.supplyRatio * 100, 1)}%</span>
       ${r.clean ? '<span class="chip req-ok">No quality faults</span>' : ''}
     </div>
+    <div><span class="stamp ${r.failed ? 'failed' : 'paid'}">${r.failed ? 'In Default' : 'Settled'}</span></div>
     <div class="row" style="margin-top:20px;justify-content:flex-end">
       <button class="btn btn-primary" data-act="close-settle">Continue</button>
     </div>`;
@@ -797,55 +930,75 @@ export function drawTrace(canvas, g) {
   if (!canvas) return;
   const dpr = window.devicePixelRatio || 1;
   const w = canvas.clientWidth, h = canvas.clientHeight;
-  if (canvas.width !== w * dpr || canvas.height !== h * dpr) {
-    canvas.width = w * dpr; canvas.height = h * dpr;
+  if (!w || !h) return;
+  if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
   }
   const ctx = canvas.getContext('2d');
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.clearRect(0, 0, w, h);
+
+  // Chart paper: pale stock, printed grid, ink traces.
+  ctx.fillStyle = '#efe7d0';
+  ctx.fillRect(0, 0, w, h);
 
   const tol = g.job && !g.job.done ? g.job.contract.freqTolHz : 2;
   const hzMin = 60 - Math.max(tol * 2.2, 2.5), hzMax = 60 + Math.max(tol * 2.2, 2.5);
   const kwMax = Math.max(g.spec.altRatingKW, ...traceBuf.demand, ...traceBuf.kw, 10) * 1.1;
-
-  // tolerance band
   const yOf = (hz) => h - ((hz - hzMin) / (hzMax - hzMin)) * h;
-  ctx.fillStyle = 'rgba(79,209,139,0.09)';
-  ctx.fillRect(0, yOf(60 + tol), w, yOf(60 - tol) - yOf(60 + tol));
-  ctx.strokeStyle = '#2a323a';
+
+  ctx.strokeStyle = 'rgba(120,95,60,0.16)';
   ctx.lineWidth = 1;
+  for (let i = 1; i < 12; i++) {
+    const x = (i / 12) * w;
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
+  }
+  for (let i = 1; i < 6; i++) {
+    const y = (i / 6) * h;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+  }
+
+  // Tolerance band, printed on the paper.
+  ctx.fillStyle = 'rgba(74,122,58,0.16)';
+  ctx.fillRect(0, yOf(60 + tol), w, yOf(60 - tol) - yOf(60 + tol));
+  ctx.strokeStyle = 'rgba(74,122,58,0.5)';
+  ctx.setLineDash([4, 3]);
   ctx.beginPath(); ctx.moveTo(0, yOf(60)); ctx.lineTo(w, yOf(60)); ctx.stroke();
+  ctx.setLineDash([]);
 
   const n = traceBuf.hz.length;
   if (n > 1) {
     const xOf = (i) => (i / (TRACE_LEN - 1)) * w;
-
-    // demand (dashed) and delivered (solid), on the kW axis
     const kwY = (v) => h - (v / kwMax) * h;
+
+    // Demand pen (dashed) and delivered pen, in blue ink.
     ctx.setLineDash([3, 3]);
-    ctx.strokeStyle = 'rgba(87,182,242,0.5)';
+    ctx.strokeStyle = 'rgba(40,80,130,0.45)';
+    ctx.lineWidth = 1;
     ctx.beginPath();
     traceBuf.demand.forEach((v, i) => (i ? ctx.lineTo(xOf(i), kwY(v)) : ctx.moveTo(xOf(i), kwY(v))));
     ctx.stroke();
     ctx.setLineDash([]);
-    ctx.strokeStyle = 'rgba(87,182,242,0.95)';
-    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = '#2b5a8c';
+    ctx.lineWidth = 1.4;
     ctx.beginPath();
     traceBuf.kw.forEach((v, i) => (i ? ctx.lineTo(xOf(i), kwY(v)) : ctx.moveTo(xOf(i), kwY(v))));
     ctx.stroke();
 
-    // frequency
-    ctx.strokeStyle = '#f2a33c';
-    ctx.lineWidth = 1.8;
+    // Frequency pen, in red ink.
+    ctx.strokeStyle = '#8e2a1c';
+    ctx.lineWidth = 1.7;
     ctx.beginPath();
     traceBuf.hz.forEach((v, i) => (i ? ctx.lineTo(xOf(i), yOf(v)) : ctx.moveTo(xOf(i), yOf(v))));
     ctx.stroke();
   }
 
-  ctx.font = '10px ui-monospace, monospace';
-  ctx.fillStyle = '#63707b';
+  ctx.font = "9px 'Cutive Mono', monospace";
+  ctx.fillStyle = '#8e2a1c';
   ctx.fillText(`${hzMax.toFixed(1)} Hz`, 4, 11);
   ctx.fillText(`${hzMin.toFixed(1)} Hz`, 4, h - 4);
-  ctx.fillStyle = 'rgba(87,182,242,0.8)';
-  ctx.fillText(`${kwMax.toFixed(0)} kW`, w - 52, 11);
+  ctx.fillStyle = '#2b5a8c';
+  ctx.textAlign = 'right';
+  ctx.fillText(`${kwMax.toFixed(0)} kW`, w - 4, 11);
+  ctx.textAlign = 'left';
 }

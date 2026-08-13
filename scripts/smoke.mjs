@@ -15,7 +15,8 @@ const page = await browser.newPage();
 page.on('console', (m) => { if (m.type() === 'error') errors.push(`console: ${m.text()}`); });
 page.on('pageerror', (e) => errors.push(`pageerror: ${e.message}`));
 
-await page.goto('http://localhost:8080/', { waitUntil: 'networkidle' });
+const BASE = process.env.SMOKE_URL ?? 'http://localhost:8080/';
+await page.goto(BASE, { waitUntil: 'networkidle' });
 await page.waitForTimeout(500);
 
 const OUT = process.env.SMOKE_OUT ?? '/tmp/loadbank-smoke';
