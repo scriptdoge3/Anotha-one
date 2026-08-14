@@ -64,7 +64,9 @@ console.log('tab after accept:', await page.locator('.tab.is-active').textConten
 // Full manual start: crank, close the field breaker, bring the volts up on the
 // rheostat, then close the main breaker.
 await page.click('[data-act="start"]');
-await page.waitForTimeout(1200);
+await page.waitForTimeout(900);
+await page.click('[data-run="run"]');       // idle -> rated
+await page.waitForTimeout(2600);
 await page.click('[data-act="field"]');
 await page.waitForTimeout(900);
 await page.click('[data-act="close"]');

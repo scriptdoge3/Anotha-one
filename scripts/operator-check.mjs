@@ -46,7 +46,9 @@ await page.click('[data-accept="t1-barn"]');
 await page.waitForTimeout(300);
 
 await page.click('[data-act="start"]');
-await page.waitForTimeout(1200);
+await page.waitForTimeout(900);
+await page.click('[data-run="run"]');       // idle -> rated
+await page.waitForTimeout(2600);
 console.log('cranked      ', JSON.stringify(await read()));
 
 await page.click('[data-act="field"]');
@@ -105,7 +107,9 @@ const hasScope = await page.locator('.scope-svg').count();
 console.log('synchroscope on the desk:', hasScope > 0);
 
 await page.click('[data-act="start"]');
-await page.waitForTimeout(1200);
+await page.waitForTimeout(900);
+await page.click('[data-run="run"]');       // idle -> rated
+await page.waitForTimeout(2600);
 await page.click('[data-act="field"]');
 await page.waitForTimeout(400);
 await page.click('[data-gov="droop"]');

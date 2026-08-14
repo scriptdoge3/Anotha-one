@@ -16,7 +16,10 @@ function running(owned = [], envOverrides = {}, load = 0, settleS = 900, opts = 
   const m = newMachine(spec);
   const env = { ...defaultEnv(), ...envOverrides };
   m.cranking = 6;
-  runFor(m, spec, env, 12);
+  // Start at idle, then bring it up to rated, the way you actually would.
+  runFor(m, spec, env, 6);
+  m.runMode = 'run';
+  runFor(m, spec, env, 16);
   if (opts.gov) m.govMode = opts.gov;
   if (opts.throttle !== undefined) m.throttle = opts.throttle;
   m.fieldClosed = true;
@@ -42,10 +45,38 @@ test('frequency maps to shaft speed on a 4-pole machine', () => {
   assert.equal(rpmToHz(1500), 50);
 });
 
-test('a stock set starts and reaches nominal speed', () => {
-  const { m } = running([], {}, 0, 20);
+test('a stock set starts at idle and has to be brought up to speed', () => {
+  const spec = baseSpec();
+  const m = newMachine(spec);
+  const env = defaultEnv();
+  m.cranking = 6;
+  runFor(m, spec, env, 10);
   assert.ok(m.running, 'engine should be running');
+  assert.ok(m.rpm > 700 && m.rpm < 950, `should have settled at idle, got ${m.rpm.toFixed(0)}`);
+
+  m.runMode = 'run';
+  runFor(m, spec, env, 3);
+  assert.ok(m.rpm < 1600, 'it should still be on its way up after three seconds');
+  runFor(m, spec, env, 13);
   assert.ok(m.rpm > 1700 && m.rpm < 1900, `rpm was ${m.rpm}`);
+});
+
+test('the run-up is paced, not a wide-open dash to rated speed', () => {
+  const spec = baseSpec();
+  const m = newMachine(spec);
+  const env = defaultEnv();
+  m.cranking = 6;
+  runFor(m, spec, env, 8);
+  m.runMode = 'run';
+  let peakRack = 0;
+  let t = 0;
+  while (m.rpm < 1790 && t < 40) {
+    runFor(m, spec, env, 0.05);
+    t += 0.05;
+    peakRack = Math.max(peakRack, m.fuelCmd);
+  }
+  assert.ok(t > 4, `reached rated speed in only ${t.toFixed(1)} s`);
+  assert.ok(peakRack < 0.75, `rack went to ${(peakRack * 100).toFixed(0)}% on the way up`);
 });
 
 test('cranking on an empty tank does not start the engine', () => {
@@ -100,7 +131,9 @@ test('sustained gross overload trips the breaker on under-frequency', () => {
   const m = newMachine(spec);
   const env = defaultEnv();
   m.cranking = 6;
-  runFor(m, spec, env, 12);
+  runFor(m, spec, env, 6);
+  m.runMode = 'run';
+  runFor(m, spec, env, 16);
   m.fieldClosed = true;
   m.excCmd = 1.0;
   runFor(m, spec, env, 4);
@@ -183,7 +216,9 @@ test('running out of fuel stops the engine and opens the breaker', () => {
   const m = newMachine(spec);
   const env = { ...defaultEnv(), demandKW: 60 };
   m.cranking = 6;
-  runFor(m, spec, env, 12);
+  runFor(m, spec, env, 6);
+  m.runMode = 'run';
+  runFor(m, spec, env, 16);
   m.fieldClosed = true;
   m.excCmd = 1.0;
   runFor(m, spec, env, 4);
@@ -249,7 +284,12 @@ test('results do not depend on the fast-forward timestep', () => {
     const m = newMachine(spec);
     const env = defaultEnv();
     m.cranking = 6;
-    runFor(m, spec, env, 10, dt);
+    runFor(m, spec, env, 6, dt);
+    m.runMode = 'run';
+    runFor(m, spec, env, 16, dt);
+    m.fieldClosed = true;
+    m.excCmd = 1.25;
+    runFor(m, spec, env, 4, dt);
     m.breakerClosed = true;
     env.demandKW = 70;
     runFor(m, spec, env, 1200, dt);

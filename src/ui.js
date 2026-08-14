@@ -448,6 +448,10 @@ export function renderOperate(g) {
                 <button class="btn btn-sm" data-act="start">Start</button>
                 <button class="btn btn-sm" data-act="stop">Stop</button>
               </div>
+              <div class="mode-switch" data-modes="run">
+                <button data-run="idle">Idle</button>
+                <button data-run="run">Rated</button>
+              </div>
               <div class="ctl-row"><button class="btn btn-sm" data-act="refuel">Refuel</button></div>
               <div class="ctl-read" data-f="engineRead">—</div>
             </div>
@@ -604,6 +608,9 @@ export function updateOperate(g, root, dt = 1 / 60) {
   for (const b of root.querySelectorAll('[data-modes="gov"] button')) {
     b.classList.toggle('is-on', b.dataset.gov === m.govMode);
   }
+  for (const b of root.querySelectorAll('[data-modes="run"] button')) {
+    b.classList.toggle('is-on', b.dataset.run === m.runMode);
+  }
 
   // Levers are the operator's hand: only write back when they are not holding
   // it, otherwise the value fights the drag.
@@ -617,7 +624,9 @@ export function updateOperate(g, root, dt = 1 / 60) {
   lever('[data-lever="exc"]', m.excCmd.toFixed(3));
 
   setText('[data-f="engineRead"]',
-    m.running ? `${num(m.rpm, 0)} rpm` : m.cranking > 0 ? 'cranking' : 'stopped');
+    m.running
+      ? `${num(m.rpm, 0)} rpm${Math.abs(m.rpm - m.speedRef) > 25 ? ' · coming up' : ''}`
+      : m.cranking > 0 ? 'cranking' : 'stopped');
 
   const rackPct = `${num(m.fuelCmd * 100, 0)}% rack`;
   setText('[data-f="govRead"]',

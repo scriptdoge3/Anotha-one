@@ -29,7 +29,9 @@ function boot(owned = [], envOverrides = {}) {
   const m = newMachine(spec);
   const env = { ...defaultEnv(), ...envOverrides };
   m.cranking = 6;
-  runFor(m, spec, env, 12);
+  runFor(m, spec, env, 6);
+  m.runMode = 'run';
+  runFor(m, spec, env, 16);
   return { m, spec, env };
 }
 
@@ -143,7 +145,9 @@ test('switching governor mode is bumpless', () => {
   const g = createGame();
   const m = g.machine;
   m.cranking = 6;
-  advanceYard(g, 12);
+  advanceYard(g, 6);
+  m.runMode = 'run';
+  advanceYard(g, 16);
   m.fieldClosed = true;
   advanceYard(g, 4);
   const before = m.fuelCmd;

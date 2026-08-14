@@ -107,6 +107,8 @@ export function baseSpec() {
     droopMin: 0.03,
     /** Governor hunting: how much the speed wanders about the setpoint. */
     hunt: 0.0016,
+    /** How fast the governor reference walks to a new speed, rpm/s. */
+    speedSlew: 175,
     /** An aneroid limits the rack to the boost actually present, so the set
      *  accepts load without laying down smoke. */
     aneroid: false,
@@ -173,6 +175,12 @@ export function newMachine(spec = baseSpec()) {
      *  island; wide droop is what lets machines share load on a bus without
      *  fighting each other. */
     droopSet: spec.droop,
+    /** 'idle' | 'run'. A set is started and warmed at idle, then brought up to
+     *  rated speed deliberately. */
+    runMode: 'idle',
+    /** Speed the governor is actually working to, which walks towards the
+     *  selected speed rather than jumping to it. */
+    speedRef: IDLE_RPM,
     /** Field rheostat, per unit. There is nothing else driving the field. */
     excCmd: 1.0,
     /** The field breaker. No field, no volts, no closing onto anything. */
@@ -266,6 +274,20 @@ export function thermalDerate(coolantC) {
 /** Last-step rack, used only to scale governor hunting with load. */
 function fuelHint(m) {
   return clamp(m.fuelCmd ?? 0, 0, 1);
+}
+
+/** Idle speed the governor holds with the run switch at IDLE. */
+export const IDLE_RPM = 800;
+
+/**
+ * How much of its indicated power a diesel can actually make at a given
+ * fraction of rated speed. Down at cranking and idle speeds the charge motion,
+ * volumetric efficiency and injection are all poor, and the engine makes
+ * nothing like its rated torque. Without this the model hands you full torque
+ * at 400 rpm and the set slams up to speed in two seconds.
+ */
+export function speedTorqueFactor(rpmNorm) {
+  return clamp(0.3 + 0.7 * (rpmNorm / 0.62), 0.3, 1);
 }
 
 /** Widest droop the governor will accept. */
@@ -394,9 +416,21 @@ export function step(m, spec, env, dt) {
   const fireRpm = m.coolantC < -10 ? 520 : 380;
 
   // ---- governor --------------------------------------------------------
+  // The governor works to a reference that walks towards the selected speed
+  // instead of stepping to it. That is what an accelerating ramp is on a real
+  // governor, and it is why a set comes up to speed over several seconds
+  // rather than arriving there on a wide-open rack.
+  const selected = m.runMode === 'run' ? speedSetpoint(m.throttle) : IDLE_RPM;
+  if (m.running) {
+    const slew = spec.speedSlew * dt;
+    m.speedRef += clamp(selected - m.speedRef, -slew, slew);
+  } else {
+    m.speedRef = IDLE_RPM;
+  }
+
   let fuelCmd = 0;
   if (m.running) {
-    const setRpm = speedSetpoint(m.throttle);
+    const setRpm = m.speedRef;
     if (m.govMode === 'manual') {
       // Hand on the rack. Nothing holds the speed but you.
       fuelCmd = clamp(m.throttle, 0, 1);
@@ -407,7 +441,7 @@ export function step(m, spec, env, dt) {
       m.huntPhase = (m.huntPhase + dt * 2.6) % (Math.PI * 2);
       const hunt = spec.hunt * Math.sin(m.huntPhase) * (0.35 + fuelHint(m));
       const droop = governorDroop(m, spec);
-      const noLoadRpm = setRpm * (1 + droop);
+      const noLoadRpm = m.speedRef * (1 + droop);
       fuelCmd = clamp((noLoadRpm - m.rpm) / (droop * NOMINAL_RPM) + hunt, 0, 1);
     }
     fuelCmd *= thermalDerate(m.coolantC);
@@ -442,7 +476,7 @@ export function step(m, spec, env, dt) {
 
   const burning = m.running || m.cranking > 0;
   const mdot = burning ? fuelActual * spec.mdotFullScale : 0;
-  const indicatedW = mdot * lhv * spec.indicatedEff * combEff;
+  const indicatedW = mdot * lhv * spec.indicatedEff * combEff * speedTorqueFactor(rpmNorm);
   let Ti = m.rpm > 20 ? indicatedW / omega : 0;
   Ti = Math.min(Ti, spec.torqueLimit);
 
@@ -550,6 +584,7 @@ export function step(m, spec, env, dt) {
     m.breakerClosed = false;
     m.synced = false;
     m.rpm = 0;
+    m.speedRef = IDLE_RPM;
     events.push({ type: 'stalled' });
   }
   // Mechanical overspeed trip. In MANUAL this is a live hazard: drop the load

@@ -37,7 +37,9 @@ for (const [name, width, height] of sizes) {
   await page.click('[data-accept="t1-barn"]');
   await page.waitForTimeout(200);
   await page.click('[data-act="start"]');
-  await page.waitForTimeout(1400);
+  await page.waitForTimeout(900);
+  await page.click('[data-run="run"]');
+  await page.waitForTimeout(2600);
   await page.click('[data-act="field"]');
   await page.waitForTimeout(900);
   await page.click('[data-act="close"]', { force: true });

@@ -7,7 +7,7 @@ import {
   createGame, advance, acceptContract, abandonJob, clearFinishedJob,
   startEngine, stopEngine, setBreaker, refuel, buyTech, buyTank,
   refreshBoard, setThrottle, bumpThrottle, setGovMode, setExcitation,
-  bumpExcitation, bumpDroop, setFieldBreaker, resetRelays, refreshSpec, SPEEDS,
+  bumpExcitation, bumpDroop, setFieldBreaker, setRunMode, resetRelays, refreshSpec, SPEEDS,
 } from './state.js';
 import * as save from './save.js';
 import {
@@ -104,7 +104,7 @@ function switchTab(tab) {
 // ------------------------------------------------------------------- input
 
 document.addEventListener('click', (ev) => {
-  const t = ev.target.closest('[data-act],[data-speed],[data-accept],[data-tech],[data-buy],[data-tab],[data-gov]');
+  const t = ev.target.closest('[data-act],[data-speed],[data-accept],[data-tech],[data-buy],[data-tab],[data-gov],[data-run]');
   if (!t) return;
 
   if (t.dataset.tab) return switchTab(t.dataset.tab);
@@ -133,6 +133,7 @@ document.addEventListener('click', (ev) => {
   }
 
   if (t.dataset.gov) return apply(setGovMode(g, t.dataset.gov));
+  if (t.dataset.run) return apply(setRunMode(g, t.dataset.run));
 
   switch (t.dataset.act) {
     case 'start': return apply(startEngine(g));

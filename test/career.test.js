@@ -260,7 +260,9 @@ test('a competently run tier-1 job turns a profit end to end', () => {
   };
 
   startEngine(g);
-  advance(g, 12);
+  advance(g, 6);
+  g.machine.runMode = 'run';
+  advance(g, 16);
   setFieldBreaker(g, true);
   for (let i = 0; i < 12; i++) { advance(g, 1); trimField(); }
   setBreaker(g, true);
@@ -269,7 +271,11 @@ test('a competently run tier-1 job turns a profit end to end', () => {
   let worstVolts = 0;
   while (g.job && !g.job.done && guard++ < 6000) {
     if (g.machine.fuelL / g.spec.tankL < 0.2) refuel(g);
-    if (!g.machine.running) { startEngine(g); advance(g, 12); setFieldBreaker(g, true); advance(g, 4); }
+    if (!g.machine.running) {
+      startEngine(g); advance(g, 6);
+      g.machine.runMode = 'run'; advance(g, 16);
+      setFieldBreaker(g, true); advance(g, 4);
+    }
     if (g.machine.running && !g.machine.breakerClosed) setBreaker(g, true);
     trimField();
     advance(g, 20);
@@ -300,7 +306,9 @@ test('leaving the field untrimmed trips the machine off on over-voltage', () => 
   const g = createGame();
   assert.ok(acceptContract(g, 't1-barn').ok);
   startEngine(g);
-  advance(g, 12);
+  advance(g, 6);
+  g.machine.runMode = 'run';
+  advance(g, 16);
   setFieldBreaker(g, true);
   setExcitation(g, 1.45);
   advance(g, 6);

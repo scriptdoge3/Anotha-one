@@ -382,6 +382,7 @@ export const TECH = [
       s.droop = 0.005;
       s.droopMin = 0.005;
       s.hunt *= 0.15;
+      s.speedSlew = 300;
     },
   },
   {

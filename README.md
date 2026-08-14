@@ -23,7 +23,7 @@ walked the board and reset it.
 
 ```bash
 npm start      # http://localhost:8080
-npm test       # 65 tests over the physics, the operator controls and the career
+npm test       # 66 tests over the physics, the operator controls and the career
 npm run apk    # build load-bank.apk  (needs ANDROID_SDK_ROOT)
 ```
 
@@ -70,6 +70,13 @@ That reversal is the central fact of synchronous machine operation, and it falls
 out of the model rather than being special-cased. Tied to a bus, the frequency
 and voltage are the bus's to hold; what you are accountable for is how much real
 power you export and how much reactive power you push into it.
+
+**Starting.** The set fires and runs at idle, around 800 rpm, and stays there
+until you put the run switch to `RATED`. The governor then walks its speed
+reference up rather than stepping to it, so the machine climbs to 1800 rpm over
+five or six seconds with the rack around a third open — not a wide-open dash.
+A diesel also makes nothing like its rated torque down at cranking speeds, and
+the model now says so.
 
 **Governor.** `HAND RACK` puts your hand directly on the fuel rack, and nothing
 at all holds the speed — drop the load with the rack open and the engine runs
@@ -155,6 +162,9 @@ being scripted:
   EMF minus armature reaction, so they sag with load — far enough, if you close
   onto a heavy load with the field still set for no load, to bring the
   under-voltage relay in before you can wind it out.
+- **Low-speed torque is poor.** Charge motion, volumetric efficiency and
+  injection are all bad at idle, so the engine makes about a third of its rated
+  torque down there. It is what stops a start being instantaneous.
 - **Paralleled machines swing.** The rotor is held to the bus by synchronising
   torque and damper windings, so a load change sets up a real ~1.5 Hz swing that
   settles out, and too much load pulls it out of step entirely.
@@ -257,7 +267,7 @@ src/main.js        frame loop and event wiring
 fonts.css          embedded period typefaces (base64, OFL)
 android/           manifest, resources and the WebView Activity
 scripts/           APK build, browser smoke test, mobile layout check
-test/              65 tests
+test/              66 tests
 ```
 
 Beyond the unit tests there are three browser checks (all need `npm i` and a
@@ -270,7 +280,8 @@ sweeping throttle against field to confirm they really do control kW and kVAr.
 The physics core is pure and deterministic, which is why the interesting
 properties are testable at all: that BSFC lands in the real range, that a
 hydraulic governor droops four times tighter than a flyweight one, that oil
-pressure falls as the oil heats, that smoke only ever appears
+pressure falls as the oil heats, that the run-up to rated speed is paced rather
+than a wide-open dash, that smoke only ever appears
 below 17.5:1, that the synchroscope turns once per beat of slip, that an
 out-of-phase close throws the overcurrent relay and locks the breaker out until
 the board is reset, while a check-sync relay prevents it happening at all, that

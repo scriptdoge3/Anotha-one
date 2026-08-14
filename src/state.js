@@ -17,6 +17,7 @@ import {
   throttleForSpeed,
   governorDroop,
   DROOP_MAX,
+  IDLE_RPM,
   resetRelays as simResetRelays,
   latchedRelays,
   anyRelayLatched,
@@ -268,6 +269,7 @@ export function startEngine(g) {
     return { ok: false, msg: 'Relay target standing — reset the board first.' };
   }
   m.cranking = 6;
+  m.speedRef = IDLE_RPM;
   return { ok: true };
 }
 
@@ -315,6 +317,19 @@ export function envFor(g) {
 }
 
 // ---- operator controls ----------------------------------------------------
+
+/**
+ * Idle / run selector. A set is started and warmed at idle, then brought up to
+ * rated speed deliberately -- the governor walks its reference up rather than
+ * throwing the rack open.
+ */
+export function setRunMode(g, mode) {
+  const m = g.machine;
+  if (m.runMode === mode) return { ok: true };
+  m.runMode = mode;
+  logLine(g, mode === 'run' ? 'Run switch to RATED — coming up to speed.' : 'Run switch to IDLE.', 'info');
+  return { ok: true };
+}
 
 export function setThrottle(g, v) {
   g.machine.throttle = clamp(v, 0, 1);
